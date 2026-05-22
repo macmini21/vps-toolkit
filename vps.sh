@@ -278,22 +278,27 @@ EOF
 }
 
 # ==================== SSR 防滥用保护 ====================
+# 参数: $1=port (可选), $2="auto" 则使用默认值不交互
 setup_abuse_protection() {
+    local port="${1:-443}"
+    local mode="${2:-interactive}"
+
     echo ""
     echo -e "${BOLD}${CYAN}━━━ SSR 防滥用保护 ━━━${NC}"
     echo ""
 
-    local port="443"
-    if [ -f "$CONFIG_FILE" ]; then
+    if [ "$mode" != "auto" ] && [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         port="${STLS_PORT:-443}"
     fi
 
     # 1. 单IP并发连接限制
     echo -e "${CYAN}[1/3] 配置单IP并发连接限制...${NC}"
-    local max_conn
-    read -rp "单IP最大并发连接数 [默认 20]: " max_conn
-    [ -z "$max_conn" ] && max_conn=20
+    local max_conn=20
+    if [ "$mode" != "auto" ]; then
+        read -rp "单IP最大并发连接数 [默认 20]: " max_conn
+        [ -z "$max_conn" ] && max_conn=20
+    fi
 
     # 检查是否已有connlimit规则，先清除
     iptables -D INPUT -p tcp --dport "$port" -m connlimit --connlimit-above "$max_conn" -j DROP 2>/dev/null
@@ -317,8 +322,13 @@ setup_abuse_protection() {
         source "$CONFIG_FILE"
         [ "$PLATFORM" = "azure" ] && default_tb=3
         [ "$PLATFORM" = "oracle" ] && default_tb=9
+    elif [ "$mode" = "auto" ]; then
+        # auto模式下通过传入的platform判断
+        [ "${_auto_platform:-}" = "azure" ] && default_tb=3
     fi
-    read -rp "每月流量上限 (TB, 0=不限) [默认 ${default_tb}]: " monthly_tb
+    if [ "$mode" != "auto" ]; then
+        read -rp "每月流量上限 (TB, 0=不限) [默认 ${default_tb}]: " monthly_tb
+    fi
     [ -z "$monthly_tb" ] && monthly_tb=$default_tb
 
     if [ "$monthly_tb" -gt 0 ] 2>/dev/null; then
@@ -619,6 +629,16 @@ install_ssr() {
 
     # fail2ban
     install_fail2ban
+
+    # 防滥用保护 (默认值自动配置)
+    _auto_platform="$platform"
+    setup_abuse_protection "$stls_port" "auto"
+    unset _auto_platform
+
+    # Oracle 保活
+    if [ "$platform" = "oracle" ]; then
+        setup_oracle_keepalive
+    fi
 
     # 生成密码
     local password
