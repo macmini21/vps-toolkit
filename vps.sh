@@ -613,7 +613,7 @@ setup_oracle_keepalive() {
     local cores
     cores=$(nproc)
     echo -e "  CPU核心数: ${BOLD}${cores}${NC}"
-    echo -e "  保活策略: 每天 8 小时, 每核 35% 负载 (日均≈12%)"
+    echo -e "  保活策略: 每天 8 小时, 每核 10% 负载 (日均≈3%)"
 
     # systemd 服务: 跑8小时后自动退出
     cat > /etc/systemd/system/oracle-keepalive.service << EOF
@@ -623,7 +623,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$(which stress-ng) --cpu ${cores} --cpu-load 35 --timeout 8h
+ExecStart=$(which stress-ng) --cpu ${cores} --cpu-load 10 --timeout 8h
 Nice=19
 KillSignal=SIGTERM
 TimeoutStopSec=5
@@ -665,7 +665,7 @@ EOF
     echo -e "${GREEN}✓${NC} 保活已配置:"
     echo -e "  • 工具: stress-ng (精确CPU负载控制)"
     echo -e "  • 时段: 每天 8 小时 (凌晨2点开始)"
-    echo -e "  • 负载: 每核 35% → 日均 ≈12%"
+    echo -e "  • 负载: 每核 10%"
     echo -e "  • 优先级: nice 19 (有其他任务时自动让出)"
     echo -e "  • 管理: systemctl stop/start oracle-keepalive"
     echo ""
