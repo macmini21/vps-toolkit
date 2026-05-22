@@ -843,15 +843,23 @@ EOF
 
     # 测速
     echo -e "${CYAN}正在测速...${NC}"
-    local dl_speed
-    dl_speed=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 \
-        "https://speed.cloudflare.com/__down?bytes=104857600" 2>/dev/null)
-    if [ -n "$dl_speed" ] && [ "$dl_speed" != "0.000" ]; then
-        local dl_mbps
-        dl_mbps=$(echo "$dl_speed" | awk '{printf "%.0f", $1 * 8 / 1048576}')
+    local dl_speed="" dl_mbps="0"
+    # 依次尝试多个测速源
+    for url in \
+        "http://cachefly.cachefly.net/100mb.test" \
+        "http://speedtest.tele2.net/10MB.zip" \
+        "https://speed.cloudflare.com/__down?bytes=52428800" \
+        "http://proof.ovh.net/files/10Mb.dat"; do
+        dl_speed=$(curl -sL -o /dev/null -w '%{speed_download}' --max-time 12 "$url" 2>/dev/null)
+        if [ -n "$dl_speed" ] && (( $(echo "$dl_speed > 1000" | bc -l 2>/dev/null || echo 0) )); then
+            dl_mbps=$(echo "$dl_speed" | awk '{printf "%.0f", $1 * 8 / 1048576}')
+            break
+        fi
+    done
+    if [ "$dl_mbps" -gt 0 ] 2>/dev/null; then
         echo -e "  带宽:     ${BOLD}${dl_mbps} Mbps${NC}"
     else
-        echo -e "  带宽:     ${YELLOW}测试失败${NC}"
+        echo -e "  带宽:     ${YELLOW}测试失败 (可手动选菜单8重测)${NC}"
     fi
 
     echo ""
@@ -945,34 +953,35 @@ speed_test() {
     echo -e "${BOLD}${CYAN}━━━ 网络带宽测速 ━━━${NC}"
     echo ""
 
-    # 下载测试 (100MB from Cloudflare)
+    # 下载测试 (多源)
     echo -e "${CYAN}测试下载速度...${NC}"
-    local dl_result
-    dl_result=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 \
-        "https://speed.cloudflare.com/__down?bytes=104857600" 2>/dev/null)
+    local dl_result="" dl_mbps="0"
+    for url in \
+        "http://cachefly.cachefly.net/100mb.test" \
+        "http://speedtest.tele2.net/10MB.zip" \
+        "https://speed.cloudflare.com/__down?bytes=104857600" \
+        "http://proof.ovh.net/files/100Mb.dat"; do
+        dl_result=$(curl -sL -o /dev/null -w '%{speed_download}' --max-time 15 "$url" 2>/dev/null)
+        if [ -n "$dl_result" ] && (( $(echo "$dl_result > 1000" | bc -l 2>/dev/null || echo 0) )); then
+            dl_mbps=$(echo "$dl_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
+            break
+        fi
+    done
 
-    if [ -n "$dl_result" ] && [ "$dl_result" != "0.000" ]; then
-        local dl_mbps
-        dl_mbps=$(echo "$dl_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
+    if [ "$(echo "$dl_mbps > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
         echo -e "  下载速度: ${BOLD}${dl_mbps} Mbps${NC}"
     else
-        # 备用测试源
-        dl_result=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 \
-            "http://cachefly.cachefly.net/100mb.test" 2>/dev/null)
-        local dl_mbps
-        dl_mbps=$(echo "$dl_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
-        echo -e "  下载速度: ${BOLD}${dl_mbps} Mbps${NC}"
+        echo -e "  下载速度: ${YELLOW}测试失败 (所有测试源不可达)${NC}"
+        dl_mbps="0"
     fi
 
-    # 上传测试 (生成10MB数据上传到Cloudflare)
+    # 上传测试
     echo -e "${CYAN}测试上传速度...${NC}"
-    local ul_result
+    local ul_result ul_mbps="0"
     ul_result=$(dd if=/dev/urandom bs=1M count=10 2>/dev/null | \
-        curl -s -o /dev/null -w '%{speed_upload}' --max-time 15 \
+        curl -sL -o /dev/null -w '%{speed_upload}' --max-time 15 \
         -X POST --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
-
-    if [ -n "$ul_result" ] && [ "$ul_result" != "0.000" ]; then
-        local ul_mbps
+    if [ -n "$ul_result" ] && (( $(echo "$ul_result > 1000" | bc -l 2>/dev/null || echo 0) )); then
         ul_mbps=$(echo "$ul_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
         echo -e "  上传速度: ${BOLD}${ul_mbps} Mbps${NC}"
     else
@@ -991,8 +1000,10 @@ speed_test() {
         echo -e "  带宽等级: ${YELLOW}${BOLD}~200Mbps${NC}"
     elif [ "$dl_int" -ge 40 ] 2>/dev/null; then
         echo -e "  带宽等级: ${YELLOW}${BOLD}~50Mbps${NC} (Oracle免费AMD常见限速)"
-    else
+    elif [ "$dl_int" -gt 0 ] 2>/dev/null; then
         echo -e "  带宽等级: ${RED}${BOLD}<50Mbps${NC} (网络较慢)"
+    else
+        echo -e "  带宽等级: ${RED}无法判断${NC}"
     fi
     echo ""
 }
