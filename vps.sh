@@ -22,7 +22,9 @@ COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 CONFIG_FILE="$INSTALL_DIR/.env"
 SS_PORT=22000
 SHADOW_TLS_PORT=443
-TLS_HOST="www.microsoft.com"
+TLS_HOST_AZURE="www.microsoft.com"
+TLS_HOST_ORACLE="www.apple.com"
+TLS_HOST_DEFAULT="www.apple.com"
 METHOD="aes-256-gcm"
 
 # ==================== Docker Compose 命令检测 ====================
@@ -268,6 +270,14 @@ install_ssr() {
     echo -e "${GREEN}✓${NC} 平台: ${BOLD}${platform}${NC}"
     echo ""
 
+    # 根据平台选择默认TLS域名
+    local default_tls
+    case "$platform" in
+        azure)  default_tls="$TLS_HOST_AZURE" ;;
+        oracle) default_tls="$TLS_HOST_ORACLE" ;;
+        *)      default_tls="$TLS_HOST_DEFAULT" ;;
+    esac
+
     # 获取节点名称
     read -rp "输入节点名称 (用于标识，如 东京01): " node_name
     [ -z "$node_name" ] && node_name="VPS-$(date +%s | tail -c 5)"
@@ -278,8 +288,8 @@ install_ssr() {
     [ -n "$custom_port" ] && stls_port=$custom_port
 
     # 自定义TLS伪装域名
-    local tls_host=$TLS_HOST
-    read -rp "TLS 伪装域名 [默认 www.microsoft.com]: " custom_tls
+    local tls_host=$default_tls
+    read -rp "TLS 伪装域名 [默认 ${default_tls}]: " custom_tls
     [ -n "$custom_tls" ] && tls_host=$custom_tls
 
     echo ""
