@@ -239,6 +239,40 @@ configure_firewall() {
     fi
 }
 
+# ==================== 安装 fail2ban ====================
+install_fail2ban() {
+    echo -e "${CYAN}配置 fail2ban (自动封禁暴力扫描IP)...${NC}"
+
+    if ! command -v fail2ban-client &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq fail2ban 2>/dev/null
+    fi
+
+    # 获取SSH端口
+    local ssh_port
+    ssh_port=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP '\d+$' | head -1)
+    [ -z "$ssh_port" ] && ssh_port=22
+
+    cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+bantime = 86400
+findtime = 600
+maxretry = 3
+banaction = iptables-multiport
+
+[sshd]
+enabled = true
+port = ${ssh_port}
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 86400
+EOF
+
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+    echo -e "${GREEN}✓${NC} fail2ban 已启用: 10分钟内3次失败 → 封禁24小时"
+}
+
 # ==================== 优化 BBR ====================
 enable_bbr() {
     echo -e "${CYAN}启用 BBR 拥塞控制...${NC}"
@@ -346,6 +380,9 @@ install_ssr() {
 
     # BBR
     enable_bbr
+
+    # fail2ban
+    install_fail2ban
 
     # 生成密码
     local password
@@ -528,6 +565,7 @@ show_menu() {
     echo -e "  ${GREEN}2)${NC} 删除 SSR"
     echo -e "  ${GREEN}3)${NC} 查看 SSR 状态/链接"
     echo -e "  ${GREEN}4)${NC} 优化网络 (BBR)"
+    echo -e "  ${GREEN}5)${NC} 安装 fail2ban (封禁暴力扫描IP)"
     echo -e "  ${GREEN}0)${NC} 退出"
     echo ""
 }
@@ -547,12 +585,13 @@ main() {
     # 交互式菜单
     while true; do
         show_menu
-        read -rp "请选择 [0-4]: " choice
+        read -rp "请选择 [0-5]: " choice
         case "$choice" in
             1) install_ssr ;;
             2) uninstall_ssr ;;
             3) status_ssr ;;
             4) enable_bbr ;;
+            5) install_fail2ban ;;
             0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
