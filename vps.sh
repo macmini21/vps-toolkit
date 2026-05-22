@@ -617,6 +617,9 @@ setup_oracle_keepalive() {
 # 机器配置: ${cores}C / ${mem_mb}MB
 # 策略: ${workers} 并行 worker × ${duration}s
 
+# 防重入: 杀掉上一次残留进程
+pkill -f "keepalive_worker" 2>/dev/null || true
+
 # 随机延迟0-30秒，避免固定模式
 sleep \$(( RANDOM % 30 ))
 
@@ -625,21 +628,15 @@ DURATION=${duration}
 
 # 启动 worker (nice 19, 不影响正常业务)
 for i in \$(seq 1 \$WORKERS); do
-    timeout \$DURATION nice -n 19 sh -c 'while true; do :; done' &
+    bash -c 'exec -a keepalive_worker timeout '\$DURATION' nice -n 19 sh -c "while true; do :; done"' &
 done
-
-# 偶尔额外增加一点 I/O 负载 (更自然的使用模式)
-if [ \$(( RANDOM % 4 )) -eq 0 ]; then
-    timeout \$(( DURATION / 3 )) nice -n 19 dd if=/dev/urandom bs=64K count=256 of=/dev/null 2>/dev/null &
-fi
 
 wait
 SCRIPT
     chmod +x /opt/ssr/keepalive.sh
 
-    # 设置 cron: 每10分钟
-    (crontab -l 2>/dev/null | grep -v "keepalive"; \
-     echo "*/10 * * * * /opt/ssr/keepalive.sh") | crontab -
+    # 只用 systemd timer 调度，移除旧 cron 条目（防止双重触发）
+    (crontab -l 2>/dev/null | grep -v "keepalive") | crontab - 2>/dev/null || true
 
     # 创建 systemd 服务 (备份，防止cron失效)
     cat > /etc/systemd/system/oracle-keepalive.service << 'EOF'
