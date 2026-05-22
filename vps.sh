@@ -139,6 +139,14 @@ harden_system() {
     echo -e "${BOLD}${CYAN}━━━ 系统安全加固 ━━━${NC}"
     echo ""
 
+    # 先停止系统自带的自动更新，防止和我们的apt操作抢锁
+    systemctl stop unattended-upgrades 2>/dev/null || true
+    systemctl stop apt-daily.timer 2>/dev/null || true
+    systemctl stop apt-daily-upgrade.timer 2>/dev/null || true
+
+    # 等待已有的apt进程结束
+    wait_for_apt_lock
+
     # 1. 系统更新
     echo -e "${CYAN}[1/5] 更新系统软件包 (可能需要几分钟)...${NC}"
     export DEBIAN_FRONTEND=noninteractive
@@ -168,8 +176,8 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
-    systemctl enable unattended-upgrades 2>/dev/null || true
-    echo -e "${GREEN}✓${NC} 自动安全更新已启用"
+    # 注意: 不在这里启动 unattended-upgrades, 等所有 apt 操作完成后再启动
+    echo -e "${GREEN}✓${NC} 自动安全更新已配置 (将在部署完成后启用)"
 
     # 3. SSH 加固
     echo -e "${CYAN}[3/5] SSH 安全加固...${NC}"
@@ -233,7 +241,7 @@ EOF
 
 # ==================== 等待 apt 锁释放 ====================
 wait_for_apt_lock() {
-    local max_wait=120
+    local max_wait=300
     local waited=0
     while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || fuser /var/lib/apt/lists/lock &>/dev/null 2>&1; do
         if [ "$waited" -eq 0 ]; then
@@ -257,13 +265,29 @@ install_docker() {
 
     echo -e "${CYAN}正在安装 Docker...${NC}"
     wait_for_apt_lock
+
+    # 修复可能损坏的 dpkg 状态
+    dpkg --configure -a 2>/dev/null || true
+    apt-get install -f -y 2>/dev/null || true
+
     if curl -fsSL https://get.docker.com | sh; then
         systemctl enable docker
         systemctl start docker
         echo -e "${GREEN}✓${NC} Docker 安装完成"
     else
-        echo -e "${RED}✗ Docker 安装失败${NC}"
-        return 1
+        # 重试一次
+        echo -e "${YELLOW}首次安装失败，修复后重试...${NC}"
+        wait_for_apt_lock
+        dpkg --configure -a 2>/dev/null || true
+        apt-get update
+        if curl -fsSL https://get.docker.com | sh; then
+            systemctl enable docker
+            systemctl start docker
+            echo -e "${GREEN}✓${NC} Docker 安装完成 (重试成功)"
+        else
+            echo -e "${RED}✗ Docker 安装失败，请手动检查: apt-get install -y docker-ce${NC}"
+            return 1
+        fi
     fi
 }
 
