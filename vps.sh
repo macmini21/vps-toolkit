@@ -583,97 +583,50 @@ setup_oracle_keepalive() {
     echo ""
     echo -e "${BOLD}${CYAN}━━━ Oracle Cloud 实例保活 ━━━${NC}"
     echo -e "${DIM}  防止免费实例因CPU使用率过低被回收${NC}"
-    echo -e "${DIM}  原理: 定期产生CPU负载，保持7天均值 >10%${NC}"
+    echo -e "${DIM}  原理: 使用 stress-ng 精确控制CPU负载${NC}"
     echo ""
 
-    # ====== 清理旧版本残留僵尸进程 ======
-    echo -e "${CYAN}清理旧版本残留进程...${NC}"
-    # 停掉旧服务
+    # ====== 清理所有旧版本残留 ======
+    echo -e "${CYAN}清理旧版本...${NC}"
     systemctl stop oracle-keepalive.service 2>/dev/null || true
     systemctl stop oracle-keepalive.timer 2>/dev/null || true
-    # 杀一切可能的残留
+    systemctl disable oracle-keepalive.timer 2>/dev/null || true
+    systemctl kill --signal=SIGKILL oracle-keepalive.service 2>/dev/null || true
+    rm -f /etc/systemd/system/oracle-keepalive.timer
     pkill -9 -f "while true; do :; done" 2>/dev/null || true
     pkill -9 -f "while :; do :; done" 2>/dev/null || true
     pkill -9 -f "keepalive_worker" 2>/dev/null || true
-    killall -9 yes 2>/dev/null || true
     pkill -9 -f "keepalive.sh" 2>/dev/null || true
-    # 杀掉所有 nice 19 的 sh 进程 (旧保活遗留)
-    ps -eo pid,ni,comm --no-headers 2>/dev/null | awk '$2 == "19" && ($3 == "sh" || $3 == "bash" || $3 == "yes") {print $1}' | xargs -r kill -9 2>/dev/null || true
-    # 移除旧 cron
+    pkill -9 -f "stress-ng" 2>/dev/null || true
+    killall -9 yes 2>/dev/null || true
+    ps -eo pid,ni,comm --no-headers 2>/dev/null | awk '$2 == "19" && ($3 == "sh" || $3 == "bash" || $3 == "yes" || $3 == "stress-ng") {print $1}' | xargs -r kill -9 2>/dev/null || true
     (crontab -l 2>/dev/null | grep -v "keepalive") | crontab - 2>/dev/null || true
-    sleep 1
-    echo -e "${GREEN}✓${NC} 旧进程已清理"
+    echo -e "${GREEN}✓${NC} 旧版本已清理"
 
-    # 检测CPU核心数和内存，计算需要的负载参数
-    local cores mem_mb
-    cores=$(nproc)
-    mem_mb=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
-    echo -e "  CPU核心数: ${BOLD}${cores}${NC}"
-    echo -e "  内存大小:  ${BOLD}${mem_mb}MB${NC}"
-
-    # 目标: 维持约12-15%的 总CPU 使用率
-    # 新方案: 常驻守护进程 + 占空比
-    # 每8秒中跑1秒 = 12.5% CPU, 永远不会飙到100%
-    local workers=$cores
-
-    # 低内存机器 (<=1GB) 限制并行数
-    if [ "$mem_mb" -le 1024 ] && [ "$workers" -gt 2 ]; then
-        workers=2
+    # 安装 stress-ng
+    if ! command -v stress-ng &>/dev/null; then
+        echo -e "${CYAN}安装 stress-ng...${NC}"
+        apt-get install -y stress-ng >/dev/null 2>&1
     fi
 
-    echo -e "  保活策略:  ${BOLD}${workers} workers, 占空比 1/8${NC} (稳定≈12%)"
+    # 检测CPU核心数
+    local cores
+    cores=$(nproc)
+    echo -e "  CPU核心数: ${BOLD}${cores}${NC}"
+    echo -e "  保活策略: stress-ng --cpu ${cores} --cpu-load 13"
 
-    # 写入保活守护脚本
-    cat > /opt/ssr/keepalive.sh << 'SCRIPT'
-#!/bin/bash
-# Oracle Cloud 实例保活 - 占空比守护进程
-# 每8秒中跑1秒CPU = 12.5% 均值, 永远不飙100%
-
-WORKERS=__WORKERS__
-
-worker() {
-    while true; do
-        # 跑1秒 CPU
-        local end=$((SECONDS + 1))
-        while [ $SECONDS -lt $end ]; do
-            :
-        done
-        # 歇7秒
-        sleep 7
-    done
-}
-
-for i in $(seq 1 $WORKERS); do
-    worker &
-done
-
-wait
-SCRIPT
-    # 替换 worker 数量
-    sed -i "s/__WORKERS__/${workers}/" /opt/ssr/keepalive.sh
-    chmod +x /opt/ssr/keepalive.sh
-
-    # 移除旧 cron 和旧 timer
-    (crontab -l 2>/dev/null | grep -v "keepalive") | crontab - 2>/dev/null || true
-    systemctl stop oracle-keepalive.timer 2>/dev/null || true
-    systemctl disable oracle-keepalive.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/oracle-keepalive.timer
-
-    # 常驻 systemd 服务 (不再用 timer)
-    cat > /etc/systemd/system/oracle-keepalive.service << 'EOF'
+    # systemd 服务直接调用 stress-ng
+    cat > /etc/systemd/system/oracle-keepalive.service << EOF
 [Unit]
-Description=Oracle Cloud Instance Keepalive
+Description=Oracle Cloud Instance Keepalive (stress-ng)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/ssr/keepalive.sh
+ExecStart=$(which stress-ng) --cpu ${cores} --cpu-load 13 --timeout 0
 Restart=always
 RestartSec=10
 Nice=19
-CPUSchedulingPolicy=idle
-KillMode=control-group
-KillSignal=SIGKILL
 
 [Install]
 WantedBy=multi-user.target
@@ -683,13 +636,21 @@ EOF
     systemctl enable oracle-keepalive.service
     systemctl restart oracle-keepalive.service
 
+    # 验证
+    sleep 2
+    if systemctl is-active oracle-keepalive.service &>/dev/null; then
+        echo -e "${GREEN}✓${NC} 保活已启动"
+    else
+        echo -e "${RED}✗ 保活启动失败，请检查: systemctl status oracle-keepalive${NC}"
+        return 1
+    fi
+
     echo ""
     echo -e "${GREEN}✓${NC} 保活已配置:"
-    echo -e "  • 模式: 常驻守护进程 (占空比)"
-    echo -e "  • 策略: ${workers} workers × 1s on / 7s off"
-    echo -e "  • 优先级: nice 19 (最低，不影响正常业务)"
-    echo -e "  • CPU均值: 稳定 12.5% (永不飙到100%)"
-    echo -e "  • 管理: systemctl status oracle-keepalive"
+    echo -e "  • 工具: stress-ng (专业CPU负载工具)"
+    echo -e "  • 负载: 每核 13% (总计 ≈13%)"
+    echo -e "  • 优先级: nice 19 (最低)"
+    echo -e "  • 管理: systemctl stop/start oracle-keepalive"
     echo ""
 }
 
