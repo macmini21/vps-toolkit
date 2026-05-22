@@ -273,6 +273,128 @@ EOF
     echo -e "${GREEN}✓${NC} fail2ban 已启用: 10分钟内3次失败 → 封禁24小时"
 }
 
+# ==================== SSR 防滥用保护 ====================
+setup_abuse_protection() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ SSR 防滥用保护 ━━━${NC}"
+    echo ""
+
+    local port="443"
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        port="${STLS_PORT:-443}"
+    fi
+
+    # 1. 单IP并发连接限制
+    echo -e "${CYAN}[1/3] 配置单IP并发连接限制...${NC}"
+    local max_conn
+    read -rp "单IP最大并发连接数 [默认 20]: " max_conn
+    [ -z "$max_conn" ] && max_conn=20
+
+    # 检查是否已有connlimit规则，先清除
+    iptables -D INPUT -p tcp --dport "$port" -m connlimit --connlimit-above "$max_conn" -j DROP 2>/dev/null
+    # 在ACCEPT规则之前插入connlimit
+    iptables -I INPUT -p tcp --dport "$port" -m connlimit --connlimit-above "$max_conn" -j DROP
+    echo -e "${GREEN}✓${NC} 单IP超过 ${max_conn} 连接将被拒绝"
+
+    # 2. 每秒新连接速率限制 (防短时间大量连接)
+    echo -e "${CYAN}[2/3] 配置新连接速率限制...${NC}"
+    iptables -D INPUT -p tcp --dport "$port" --syn -m limit --limit 30/s --limit-burst 50 -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport "$port" --syn -j DROP 2>/dev/null
+    iptables -I INPUT -p tcp --dport "$port" --syn -j DROP
+    iptables -I INPUT -p tcp --dport "$port" --syn -m limit --limit 30/s --limit-burst 50 -j ACCEPT
+    echo -e "${GREEN}✓${NC} 新连接限速: 30/秒 (突发50)"
+
+    # 3. 每日流量配额
+    echo -e "${CYAN}[3/3] 配置每日流量配额...${NC}"
+    local daily_gb
+    read -rp "每日流量上限 (GB, 0=不限) [默认 50]: " daily_gb
+    [ -z "$daily_gb" ] && daily_gb=50
+
+    if [ "$daily_gb" -gt 0 ] 2>/dev/null; then
+        # 安装 vnstat (流量统计)
+        if ! command -v vnstat &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq vnstat 2>/dev/null
+            systemctl enable vnstat
+            systemctl start vnstat
+        fi
+
+        # 创建流量检查脚本
+        cat > /opt/ssr/check_traffic.sh << 'SCRIPT'
+#!/bin/bash
+# 每日流量配额检查
+DAILY_LIMIT_GB=PLACEHOLDER_GB
+COMPOSE_DIR="/opt/ssr"
+
+# 获取今日已用流量 (MB)
+TODAY_MB=$(vnstat -d 1 --oneline | awk -F';' '{print $6}' | grep -oP '[\d.]+')
+TODAY_UNIT=$(vnstat -d 1 --oneline | awk -F';' '{print $6}' | grep -oP '[A-Z]+')
+
+# 转换为GB
+if [ "$TODAY_UNIT" = "GiB" ] || [ "$TODAY_UNIT" = "GB" ]; then
+    TODAY_GB=$(echo "$TODAY_MB" | awk '{printf "%.1f", $1}')
+elif [ "$TODAY_UNIT" = "MiB" ] || [ "$TODAY_UNIT" = "MB" ]; then
+    TODAY_GB=$(echo "$TODAY_MB" | awk '{printf "%.1f", $1/1024}')
+else
+    TODAY_GB="0"
+fi
+
+LIMIT_CHECK=$(echo "$TODAY_GB $DAILY_LIMIT_GB" | awk '{if ($1 >= $2) print "over"; else print "ok"}')
+
+if [ "$LIMIT_CHECK" = "over" ]; then
+    cd "$COMPOSE_DIR"
+    if docker compose ps 2>/dev/null | grep -q "running"; then
+        docker compose stop
+        echo "[$(date)] 流量超限 (${TODAY_GB}GB >= ${DAILY_LIMIT_GB}GB), 服务已停止" >> /opt/ssr/traffic.log
+    elif docker-compose ps 2>/dev/null | grep -q "Up"; then
+        docker-compose stop
+        echo "[$(date)] 流量超限 (${TODAY_GB}GB >= ${DAILY_LIMIT_GB}GB), 服务已停止" >> /opt/ssr/traffic.log
+    fi
+fi
+SCRIPT
+        sed -i "s/PLACEHOLDER_GB/$daily_gb/" /opt/ssr/check_traffic.sh
+        chmod +x /opt/ssr/check_traffic.sh
+
+        # 每日自动恢复脚本
+        cat > /opt/ssr/daily_reset.sh << 'SCRIPT'
+#!/bin/bash
+# 每日零点自动恢复服务
+cd /opt/ssr
+if docker compose version &>/dev/null; then
+    docker compose start
+else
+    docker-compose start
+fi
+echo "[$(date)] 每日重置, 服务已恢复" >> /opt/ssr/traffic.log
+SCRIPT
+        chmod +x /opt/ssr/daily_reset.sh
+
+        # 设置 cron: 每5分钟检查流量 + 每日零点恢复
+        (crontab -l 2>/dev/null | grep -v "check_traffic\|daily_reset"; \
+         echo "*/5 * * * * /opt/ssr/check_traffic.sh"; \
+         echo "0 0 * * * /opt/ssr/daily_reset.sh") | crontab -
+
+        echo -e "${GREEN}✓${NC} 每日流量配额: ${daily_gb}GB (超限停服, 次日自动恢复)"
+    else
+        echo -e "${GREEN}✓${NC} 跳过流量配额"
+    fi
+
+    # 持久化iptables
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save
+    else
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+
+    echo ""
+    echo -e "${BOLD}${GREEN}防滥用保护已配置:${NC}"
+    echo -e "  • 单IP最大并发: ${BOLD}${max_conn}${NC} 连接"
+    echo -e "  • 新连接速率:   ${BOLD}30/秒${NC} (突发50)"
+    [ "$daily_gb" -gt 0 ] 2>/dev/null && echo -e "  • 每日流量上限: ${BOLD}${daily_gb}GB${NC} (超限停服, 次日恢复)"
+    echo ""
+}
+
 # ==================== 优化 BBR ====================
 enable_bbr() {
     echo -e "${CYAN}启用 BBR 拥塞控制...${NC}"
@@ -566,6 +688,7 @@ show_menu() {
     echo -e "  ${GREEN}3)${NC} 查看 SSR 状态/链接"
     echo -e "  ${GREEN}4)${NC} 优化网络 (BBR)"
     echo -e "  ${GREEN}5)${NC} 安装 fail2ban (封禁暴力扫描IP)"
+    echo -e "  ${GREEN}6)${NC} SSR 防滥用保护 (限连接/限流量)"
     echo -e "  ${GREEN}0)${NC} 退出"
     echo ""
 }
@@ -585,13 +708,14 @@ main() {
     # 交互式菜单
     while true; do
         show_menu
-        read -rp "请选择 [0-5]: " choice
+        read -rp "请选择 [0-6]: " choice
         case "$choice" in
             1) install_ssr ;;
             2) uninstall_ssr ;;
             3) status_ssr ;;
             4) enable_bbr ;;
             5) install_fail2ban ;;
+            6) setup_abuse_protection ;;
             0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
