@@ -143,13 +143,15 @@ harden_system() {
     echo -e "${CYAN}[1/5] 更新系统软件包 (可能需要几分钟)...${NC}"
     export DEBIAN_FRONTEND=noninteractive
     export NEEDRESTART_MODE=a
-    apt-get update -q
-    apt-get upgrade -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-    echo -e "${GREEN}✓${NC} 系统已更新"
+    if apt-get update && apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"; then
+        echo -e "${GREEN}✓${NC} 系统已更新"
+    else
+        echo -e "${YELLOW}⚠ 部分包更新失败，继续执行${NC}"
+    fi
 
     # 2. 启用自动安全更新
     echo -e "${CYAN}[2/5] 配置自动安全更新...${NC}"
-    apt-get install -y -qq unattended-upgrades apt-listchanges 2>/dev/null
+    apt-get install -y unattended-upgrades apt-listchanges >/dev/null 2>&1
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -255,7 +257,7 @@ install_docker_compose() {
     fi
 
     echo -e "${CYAN}正在安装 Docker Compose 插件...${NC}"
-    apt-get update -qq && apt-get install -y -qq docker-compose-plugin 2>/dev/null || {
+    apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null || {
         # fallback: 安装独立版本
         local version
         version=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
@@ -345,7 +347,7 @@ install_fail2ban() {
     echo -e "${CYAN}配置 fail2ban (自动封禁暴力扫描IP)...${NC}"
 
     if ! command -v fail2ban-client &>/dev/null; then
-        apt-get update -qq && apt-get install -y -qq fail2ban 2>/dev/null
+        apt-get update -qq && apt-get install -y fail2ban
     fi
 
     # 获取SSH端口
