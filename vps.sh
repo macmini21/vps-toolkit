@@ -202,9 +202,9 @@ net.ipv6.conf.all.accept_source_route = 0
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
-# 禁止IP转发 (非路由器)
-net.ipv4.ip_forward = 0
-net.ipv6.conf.all.forwarding = 0
+# 禁止IP转发 (非路由器, 注意: Docker会覆盖此设置)
+# net.ipv4.ip_forward = 0
+# net.ipv6.conf.all.forwarding = 0
 # 记录异常包
 net.ipv4.conf.all.log_martians = 1
 EOF
@@ -218,7 +218,7 @@ EOF
         if systemctl is-active "$svc" &>/dev/null; then
             systemctl stop "$svc" 2>/dev/null
             systemctl disable "$svc" 2>/dev/null
-            ((disabled++))
+            disabled=$((disabled + 1))
         fi
     done
     echo -e "${GREEN}✓${NC} 已停用 ${disabled} 个不必要的服务"
@@ -306,6 +306,7 @@ configure_firewall() {
         iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: " --log-level 4
 
         # 持久化规则
+        apt-get install -y -qq iptables-persistent netfilter-persistent 2>/dev/null || true
         if command -v netfilter-persistent &>/dev/null; then
             netfilter-persistent save
         else
@@ -396,9 +397,9 @@ setup_abuse_protection() {
     fi
 
     # 检查是否已有connlimit规则，先清除
-    iptables -D INPUT -p tcp --dport "$port" -m connlimit --connlimit-above "$max_conn" -j DROP 2>/dev/null
-    # 在ACCEPT规则之前插入connlimit
-    iptables -I INPUT -p tcp --dport "$port" -m connlimit --connlimit-above "$max_conn" -j DROP
+    iptables -D INPUT -p tcp --dport "$port" -m state --state NEW -m connlimit --connlimit-above "$max_conn" -j DROP 2>/dev/null
+    # 在ACCEPT规则之前插入connlimit (仅对新连接生效,不影响已建立连接)
+    iptables -I INPUT -p tcp --dport "$port" -m state --state NEW -m connlimit --connlimit-above "$max_conn" -j DROP
     echo -e "${GREEN}✓${NC} 单IP超过 ${max_conn} 连接将被拒绝"
 
     # 2. 每秒新连接速率限制 (防短时间大量连接)
@@ -728,6 +729,9 @@ install_ssr() {
     # fail2ban
     install_fail2ban
 
+    # 创建安装目录 (防滥用和保活脚本需要写入此目录)
+    mkdir -p "$INSTALL_DIR"
+
     # 防滥用保护 (默认值自动配置)
     _auto_platform="$platform"
     setup_abuse_protection "$stls_port" "auto"
@@ -745,9 +749,6 @@ install_ssr() {
     # 获取公网IP
     local public_ip
     public_ip=$(get_public_ip)
-
-    # 创建安装目录
-    mkdir -p "$INSTALL_DIR"
 
     # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" << EOF
@@ -864,6 +865,15 @@ uninstall_ssr() {
     compose_cmd=$(get_compose_cmd)
     [ -z "$compose_cmd" ] && compose_cmd="docker compose"
     $compose_cmd down --rmi all 2>/dev/null || $compose_cmd down 2>/dev/null
+
+    # 清理 cron 任务
+    (crontab -l 2>/dev/null | grep -v "check_traffic\|monthly_reset\|keepalive") | crontab - 2>/dev/null
+
+    # 清理 systemd timer
+    systemctl stop oracle-keepalive.timer 2>/dev/null
+    systemctl disable oracle-keepalive.timer 2>/dev/null
+    rm -f /etc/systemd/system/oracle-keepalive.service /etc/systemd/system/oracle-keepalive.timer
+    systemctl daemon-reload 2>/dev/null
 
     echo -e "${CYAN}清理文件...${NC}"
     rm -rf "$INSTALL_DIR"
