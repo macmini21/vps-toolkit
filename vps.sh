@@ -133,6 +133,101 @@ generate_ss_link() {
     echo "ss://${encoded}?tfo=1&shadow-tls=${stls_encoded}#${tag_encoded}"
 }
 
+# ==================== 系统安全加固 ====================
+harden_system() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ 系统安全加固 ━━━${NC}"
+    echo ""
+
+    # 1. 系统更新
+    echo -e "${CYAN}[1/5] 更新系统软件包...${NC}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+    echo -e "${GREEN}✓${NC} 系统已更新"
+
+    # 2. 启用自动安全更新
+    echo -e "${CYAN}[2/5] 配置自动安全更新...${NC}"
+    apt-get install -y -qq unattended-upgrades apt-listchanges 2>/dev/null
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+    systemctl enable unattended-upgrades 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} 自动安全更新已启用"
+
+    # 3. SSH 加固
+    echo -e "${CYAN}[3/5] SSH 安全加固...${NC}"
+    local sshd_config="/etc/ssh/sshd_config"
+    # 禁止root密码登录 (保留key登录)
+    sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
+    # 禁止空密码
+    sed -i -E 's/^#?PermitEmptyPasswords.*/PermitEmptyPasswords no/' "$sshd_config"
+    # 限制认证尝试次数
+    sed -i -E 's/^#?MaxAuthTries.*/MaxAuthTries 3/' "$sshd_config"
+    # 关闭X11转发
+    sed -i -E 's/^#?X11Forwarding.*/X11Forwarding no/' "$sshd_config"
+    # 登录超时60秒
+    sed -i -E 's/^#?LoginGraceTime.*/LoginGraceTime 60/' "$sshd_config"
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} SSH 已加固 (Root仅key登录, MaxAuthTries=3)"
+
+    # 4. 内核安全参数
+    echo -e "${CYAN}[4/5] 内核安全加固...${NC}"
+    cat > /etc/sysctl.d/98-security.conf << 'EOF'
+# 防止IP欺骗
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# 忽略ICMP重定向 (防MITM)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+# 忽略源路由
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+# SYN洪水防护
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+# 禁止IP转发 (非路由器)
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+# 记录异常包
+net.ipv4.conf.all.log_martians = 1
+EOF
+    sysctl --system >/dev/null 2>&1
+    echo -e "${GREEN}✓${NC} 内核安全参数已应用"
+
+    # 5. 清理不必要的服务
+    echo -e "${CYAN}[5/5] 清理不必要的服务...${NC}"
+    local disabled=0
+    for svc in rpcbind avahi-daemon cups snapd; do
+        if systemctl is-active "$svc" &>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null
+            systemctl disable "$svc" 2>/dev/null
+            ((disabled++))
+        fi
+    done
+    echo -e "${GREEN}✓${NC} 已停用 ${disabled} 个不必要的服务"
+
+    echo ""
+    echo -e "${BOLD}${GREEN}系统加固完成${NC}"
+    echo ""
+}
+
 # ==================== 安装 Docker ====================
 install_docker() {
     if command -v docker &>/dev/null; then
@@ -616,6 +711,9 @@ install_ssr() {
     [ -n "$custom_tls" ] && tls_host=$custom_tls
 
     echo ""
+
+    # 系统安全加固 (更新+SSH+内核+清理)
+    harden_system
 
     # 安装依赖
     install_docker || { echo -e "${RED}Docker 安装失败${NC}"; return 1; }
