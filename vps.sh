@@ -305,13 +305,19 @@ setup_abuse_protection() {
     iptables -I INPUT -p tcp --dport "$port" --syn -m limit --limit 30/s --limit-burst 50 -j ACCEPT
     echo -e "${GREEN}✓${NC} 新连接限速: 30/秒 (突发50)"
 
-    # 3. 每日流量配额
-    echo -e "${CYAN}[3/3] 配置每日流量配额...${NC}"
-    local daily_gb
-    read -rp "每日流量上限 (GB, 0=不限) [默认 50]: " daily_gb
-    [ -z "$daily_gb" ] && daily_gb=50
+    # 3. 月度流量配额
+    echo -e "${CYAN}[3/3] 配置月度流量配额...${NC}"
+    local monthly_tb
+    local default_tb=9
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        [ "$PLATFORM" = "azure" ] && default_tb=3
+        [ "$PLATFORM" = "oracle" ] && default_tb=9
+    fi
+    read -rp "每月流量上限 (TB, 0=不限) [默认 ${default_tb}]: " monthly_tb
+    [ -z "$monthly_tb" ] && monthly_tb=$default_tb
 
-    if [ "$daily_gb" -gt 0 ] 2>/dev/null; then
+    if [ "$monthly_tb" -gt 0 ] 2>/dev/null; then
         # 安装 vnstat (流量统计)
         if ! command -v vnstat &>/dev/null; then
             apt-get update -qq && apt-get install -y -qq vnstat 2>/dev/null
@@ -319,62 +325,63 @@ setup_abuse_protection() {
             systemctl start vnstat
         fi
 
+        local monthly_gb=$(( monthly_tb * 1024 ))
+
         # 创建流量检查脚本
         cat > /opt/ssr/check_traffic.sh << 'SCRIPT'
 #!/bin/bash
-# 每日流量配额检查
-DAILY_LIMIT_GB=PLACEHOLDER_GB
+# 月度流量配额检查
+MONTHLY_LIMIT_GB=PLACEHOLDER_GB
 COMPOSE_DIR="/opt/ssr"
 
-# 获取今日已用流量 (MB)
-TODAY_MB=$(vnstat -d 1 --oneline | awk -F';' '{print $6}' | grep -oP '[\d.]+')
-TODAY_UNIT=$(vnstat -d 1 --oneline | awk -F';' '{print $6}' | grep -oP '[A-Z]+')
+# 获取本月已用流量
+MONTH_DATA=$(vnstat -m 1 --oneline 2>/dev/null | awk -F';' '{print $11}')
+MONTH_VAL=$(echo "$MONTH_DATA" | grep -oP '[\d.]+')
+MONTH_UNIT=$(echo "$MONTH_DATA" | grep -oP '[A-Z][a-zA-Z]+')
 
 # 转换为GB
-if [ "$TODAY_UNIT" = "GiB" ] || [ "$TODAY_UNIT" = "GB" ]; then
-    TODAY_GB=$(echo "$TODAY_MB" | awk '{printf "%.1f", $1}')
-elif [ "$TODAY_UNIT" = "MiB" ] || [ "$TODAY_UNIT" = "MB" ]; then
-    TODAY_GB=$(echo "$TODAY_MB" | awk '{printf "%.1f", $1/1024}')
-else
-    TODAY_GB="0"
-fi
+MONTH_GB=0
+case "$MONTH_UNIT" in
+    TiB|TB)  MONTH_GB=$(echo "$MONTH_VAL" | awk '{printf "%.0f", $1*1024}') ;;
+    GiB|GB)  MONTH_GB=$(echo "$MONTH_VAL" | awk '{printf "%.0f", $1}') ;;
+    MiB|MB)  MONTH_GB=$(echo "$MONTH_VAL" | awk '{printf "%.0f", $1/1024}') ;;
+    *)       MONTH_GB=0 ;;
+esac
 
-LIMIT_CHECK=$(echo "$TODAY_GB $DAILY_LIMIT_GB" | awk '{if ($1 >= $2) print "over"; else print "ok"}')
-
-if [ "$LIMIT_CHECK" = "over" ]; then
+if [ "$MONTH_GB" -ge "$MONTHLY_LIMIT_GB" ] 2>/dev/null; then
     cd "$COMPOSE_DIR"
     if docker compose ps 2>/dev/null | grep -q "running"; then
         docker compose stop
-        echo "[$(date)] 流量超限 (${TODAY_GB}GB >= ${DAILY_LIMIT_GB}GB), 服务已停止" >> /opt/ssr/traffic.log
+        echo "[$(date)] 月流量超限 (${MONTH_GB}GB >= ${MONTHLY_LIMIT_GB}GB), 服务已停止" >> /opt/ssr/traffic.log
     elif docker-compose ps 2>/dev/null | grep -q "Up"; then
         docker-compose stop
-        echo "[$(date)] 流量超限 (${TODAY_GB}GB >= ${DAILY_LIMIT_GB}GB), 服务已停止" >> /opt/ssr/traffic.log
+        echo "[$(date)] 月流量超限 (${MONTH_GB}GB >= ${MONTHLY_LIMIT_GB}GB), 服务已停止" >> /opt/ssr/traffic.log
     fi
 fi
 SCRIPT
-        sed -i "s/PLACEHOLDER_GB/$daily_gb/" /opt/ssr/check_traffic.sh
+        sed -i "s/PLACEHOLDER_GB/$monthly_gb/" /opt/ssr/check_traffic.sh
         chmod +x /opt/ssr/check_traffic.sh
 
-        # 每日自动恢复脚本
-        cat > /opt/ssr/daily_reset.sh << 'SCRIPT'
+        # 每月1号自动恢复脚本
+        cat > /opt/ssr/monthly_reset.sh << 'SCRIPT'
 #!/bin/bash
-# 每日零点自动恢复服务
+# 每月1号自动恢复服务
 cd /opt/ssr
 if docker compose version &>/dev/null; then
     docker compose start
 else
     docker-compose start
 fi
-echo "[$(date)] 每日重置, 服务已恢复" >> /opt/ssr/traffic.log
+echo "[$(date)] 月度重置, 服务已恢复" >> /opt/ssr/traffic.log
 SCRIPT
-        chmod +x /opt/ssr/daily_reset.sh
+        chmod +x /opt/ssr/monthly_reset.sh
 
-        # 设置 cron: 每5分钟检查流量 + 每日零点恢复
-        (crontab -l 2>/dev/null | grep -v "check_traffic\|daily_reset"; \
-         echo "*/5 * * * * /opt/ssr/check_traffic.sh"; \
-         echo "0 0 * * * /opt/ssr/daily_reset.sh") | crontab -
+        # 设置 cron: 每30分钟检查流量 + 每月1号恢复
+        (crontab -l 2>/dev/null | grep -v "check_traffic\|monthly_reset\|daily_reset"; \
+         echo "*/30 * * * * /opt/ssr/check_traffic.sh"; \
+         echo "0 0 1 * * /opt/ssr/monthly_reset.sh") | crontab -
 
-        echo -e "${GREEN}✓${NC} 每日流量配额: ${daily_gb}GB (超限停服, 次日自动恢复)"
+        echo -e "${GREEN}✓${NC} 月度流量配额: ${monthly_tb}TB (超限停服, 次月1号恢复)"
     else
         echo -e "${GREEN}✓${NC} 跳过流量配额"
     fi
@@ -391,7 +398,99 @@ SCRIPT
     echo -e "${BOLD}${GREEN}防滥用保护已配置:${NC}"
     echo -e "  • 单IP最大并发: ${BOLD}${max_conn}${NC} 连接"
     echo -e "  • 新连接速率:   ${BOLD}30/秒${NC} (突发50)"
-    [ "$daily_gb" -gt 0 ] 2>/dev/null && echo -e "  • 每日流量上限: ${BOLD}${daily_gb}GB${NC} (超限停服, 次日恢复)"
+    [ "$monthly_tb" -gt 0 ] 2>/dev/null && echo -e "  • 月度流量上限: ${BOLD}${monthly_tb}TB${NC} (超限停服, 次月恢复)"
+    echo ""
+}
+
+# ==================== Oracle Cloud 保活 ====================
+setup_oracle_keepalive() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ Oracle Cloud 实例保活 ━━━${NC}"
+    echo -e "${DIM}  防止免费实例因CPU使用率过低被回收${NC}"
+    echo -e "${DIM}  原理: 定期产生CPU负载，保持7天均值 >10%${NC}"
+    echo ""
+
+    # 检测CPU核心数，计算需要的负载时间
+    local cores
+    cores=$(nproc)
+    echo -e "  CPU核心数: ${BOLD}${cores}${NC}"
+
+    # 目标: 维持约12-15%的CPU使用率
+    # 策略: 每10分钟跑一个CPU密集任务，持续约90秒
+    # 4核机器: 单核跑90秒 = 90/(600*4) ≈ 3.75% 单次
+    # 每10分钟跑一次: 占比约15%
+
+    local duration=90
+    if [ "$cores" -ge 4 ]; then
+        duration=90
+    elif [ "$cores" -ge 2 ]; then
+        duration=60
+    else
+        duration=45
+    fi
+
+    cat > /opt/ssr/keepalive.sh << SCRIPT
+#!/bin/bash
+# Oracle Cloud 实例保活 - CPU负载生成
+# 每10分钟运行，产生足够CPU使用率防止回收
+# 核心数: ${cores}, 单次持续: ${duration}秒
+
+# 随机延迟0-30秒，避免固定模式
+sleep \$(( RANDOM % 30 ))
+
+# 单核CPU密集计算 (不影响正常使用)
+timeout ${duration} nice -n 19 dd if=/dev/urandom bs=1M count=1024 2>/dev/null | md5sum >/dev/null 2>&1 &
+
+# 偶尔多跑一个核心 (随机化，更自然)
+if [ \$(( RANDOM % 3 )) -eq 0 ]; then
+    timeout $(( duration / 2 )) nice -n 19 sha256sum /dev/urandom >/dev/null 2>&1 &
+fi
+
+wait
+SCRIPT
+    chmod +x /opt/ssr/keepalive.sh
+
+    # 设置 cron: 每10分钟
+    (crontab -l 2>/dev/null | grep -v "keepalive"; \
+     echo "*/10 * * * * /opt/ssr/keepalive.sh") | crontab -
+
+    # 创建 systemd 服务 (备份，防止cron失效)
+    cat > /etc/systemd/system/oracle-keepalive.service << 'EOF'
+[Unit]
+Description=Oracle Cloud Instance Keepalive
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ssr/keepalive.sh
+Nice=19
+CPUSchedulingPolicy=idle
+EOF
+
+    cat > /etc/systemd/system/oracle-keepalive.timer << 'EOF'
+[Unit]
+Description=Run Oracle Keepalive every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable oracle-keepalive.timer
+    systemctl start oracle-keepalive.timer
+
+    echo ""
+    echo -e "${GREEN}✓${NC} 保活已配置:"
+    echo -e "  • 频率: 每10分钟"
+    echo -e "  • 持续: ~${duration}秒/次"
+    echo -e "  • 优先级: nice 19 (最低，不影响正常业务)"
+    echo -e "  • 预估CPU均值: 12-15%"
+    echo -e "  • 双保险: cron + systemd timer"
     echo ""
 }
 
@@ -689,6 +788,7 @@ show_menu() {
     echo -e "  ${GREEN}4)${NC} 优化网络 (BBR)"
     echo -e "  ${GREEN}5)${NC} 安装 fail2ban (封禁暴力扫描IP)"
     echo -e "  ${GREEN}6)${NC} SSR 防滥用保护 (限连接/限流量)"
+    echo -e "  ${GREEN}7)${NC} Oracle Cloud 保活 (防停机回收)"
     echo -e "  ${GREEN}0)${NC} 退出"
     echo ""
 }
@@ -708,7 +808,7 @@ main() {
     # 交互式菜单
     while true; do
         show_menu
-        read -rp "请选择 [0-6]: " choice
+        read -rp "请选择 [0-7]: " choice
         case "$choice" in
             1) install_ssr ;;
             2) uninstall_ssr ;;
@@ -716,6 +816,7 @@ main() {
             4) enable_bbr ;;
             5) install_fail2ban ;;
             6) setup_abuse_protection ;;
+            7) setup_oracle_keepalive ;;
             0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
