@@ -921,6 +921,64 @@ status_ssr() {
     echo ""
 }
 
+# ==================== 网络测速 ====================
+speed_test() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ 网络带宽测速 ━━━${NC}"
+    echo ""
+
+    # 下载测试 (100MB from Cloudflare)
+    echo -e "${CYAN}测试下载速度...${NC}"
+    local dl_result
+    dl_result=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 \
+        "https://speed.cloudflare.com/__down?bytes=104857600" 2>/dev/null)
+
+    if [ -n "$dl_result" ] && [ "$dl_result" != "0.000" ]; then
+        local dl_mbps
+        dl_mbps=$(echo "$dl_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
+        echo -e "  下载速度: ${BOLD}${dl_mbps} Mbps${NC}"
+    else
+        # 备用测试源
+        dl_result=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 \
+            "http://cachefly.cachefly.net/100mb.test" 2>/dev/null)
+        local dl_mbps
+        dl_mbps=$(echo "$dl_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
+        echo -e "  下载速度: ${BOLD}${dl_mbps} Mbps${NC}"
+    fi
+
+    # 上传测试 (生成10MB数据上传到Cloudflare)
+    echo -e "${CYAN}测试上传速度...${NC}"
+    local ul_result
+    ul_result=$(dd if=/dev/urandom bs=1M count=10 2>/dev/null | \
+        curl -s -o /dev/null -w '%{speed_upload}' --max-time 15 \
+        -X POST --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
+
+    if [ -n "$ul_result" ] && [ "$ul_result" != "0.000" ]; then
+        local ul_mbps
+        ul_mbps=$(echo "$ul_result" | awk '{printf "%.1f", $1 * 8 / 1048576}')
+        echo -e "  上传速度: ${BOLD}${ul_mbps} Mbps${NC}"
+    else
+        echo -e "  上传速度: ${YELLOW}测试失败${NC}"
+    fi
+
+    # 判断带宽等级
+    echo ""
+    local dl_int
+    dl_int=$(echo "$dl_mbps" | awk '{printf "%d", $1}')
+    if [ "$dl_int" -ge 800 ] 2>/dev/null; then
+        echo -e "  带宽等级: ${GREEN}${BOLD}≥1Gbps${NC} (无明显限速)"
+    elif [ "$dl_int" -ge 400 ] 2>/dev/null; then
+        echo -e "  带宽等级: ${GREEN}${BOLD}~500Mbps${NC}"
+    elif [ "$dl_int" -ge 150 ] 2>/dev/null; then
+        echo -e "  带宽等级: ${YELLOW}${BOLD}~200Mbps${NC}"
+    elif [ "$dl_int" -ge 40 ] 2>/dev/null; then
+        echo -e "  带宽等级: ${YELLOW}${BOLD}~50Mbps${NC} (Oracle免费AMD常见限速)"
+    else
+        echo -e "  带宽等级: ${RED}${BOLD}<50Mbps${NC} (网络较慢)"
+    fi
+    echo ""
+}
+
 # ==================== 主菜单 ====================
 show_menu() {
     echo ""
@@ -935,6 +993,7 @@ show_menu() {
     echo -e "  ${GREEN}5)${NC} 安装 fail2ban (封禁暴力扫描IP)"
     echo -e "  ${GREEN}6)${NC} SSR 防滥用保护 (限连接/限流量)"
     echo -e "  ${GREEN}7)${NC} Oracle Cloud 保活 (防停机回收)"
+    echo -e "  ${GREEN}8)${NC} 网络测速 (检测带宽限速)"
     echo -e "  ${GREEN}0)${NC} 退出"
     echo ""
 }
@@ -954,7 +1013,7 @@ main() {
     # 交互式菜单
     while true; do
         show_menu
-        read -rp "请选择 [0-7]: " choice
+        read -rp "请选择 [0-8]: " choice
         case "$choice" in
             1) install_ssr ;;
             2) uninstall_ssr ;;
@@ -963,6 +1022,7 @@ main() {
             5) install_fail2ban ;;
             6) setup_abuse_protection ;;
             7) setup_oracle_keepalive ;;
+            8) speed_test ;;
             0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
