@@ -143,9 +143,25 @@ harden_system() {
     systemctl stop unattended-upgrades 2>/dev/null || true
     systemctl stop apt-daily.timer 2>/dev/null || true
     systemctl stop apt-daily-upgrade.timer 2>/dev/null || true
+    systemctl kill unattended-upgrades 2>/dev/null || true
 
-    # 等待已有的apt进程结束
-    wait_for_apt_lock
+    # 等30秒看锁能否自然释放，否则强杀
+    local lock_waited=0
+    while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || fuser /var/lib/apt/lists/lock &>/dev/null 2>&1; do
+        if [ "$lock_waited" -eq 0 ]; then
+            echo -e "${YELLOW}等待 apt 锁释放...${NC}"
+        fi
+        sleep 5
+        lock_waited=$((lock_waited + 5))
+        if [ "$lock_waited" -ge 30 ]; then
+            echo -e "${YELLOW}锁等待超时，强制终止占用进程...${NC}"
+            killall -9 apt apt-get dpkg unattended-upgr 2>/dev/null || true
+            sleep 2
+            rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock 2>/dev/null || true
+            dpkg --configure -a 2>/dev/null || true
+            break
+        fi
+    done
 
     # 1. 系统更新
     echo -e "${CYAN}[1/5] 更新系统软件包 (可能需要几分钟)...${NC}"
