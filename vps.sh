@@ -140,10 +140,11 @@ harden_system() {
     echo ""
 
     # 1. 系统更新
-    echo -e "${CYAN}[1/5] 更新系统软件包...${NC}"
+    echo -e "${CYAN}[1/5] 更新系统软件包 (可能需要几分钟)...${NC}"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+    export NEEDRESTART_MODE=a
+    apt-get update -q
+    apt-get upgrade -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
     echo -e "${GREEN}✓${NC} 系统已更新"
 
     # 2. 启用自动安全更新
