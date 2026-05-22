@@ -231,6 +231,23 @@ EOF
     echo ""
 }
 
+# ==================== 等待 apt 锁释放 ====================
+wait_for_apt_lock() {
+    local max_wait=120
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || fuser /var/lib/apt/lists/lock &>/dev/null 2>&1; do
+        if [ "$waited" -eq 0 ]; then
+            echo -e "${YELLOW}等待 apt 锁释放 (其他进程正在使用包管理器)...${NC}"
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        if [ "$waited" -ge "$max_wait" ]; then
+            echo -e "${YELLOW}⚠ 等待超时，尝试继续${NC}"
+            break
+        fi
+    done
+}
+
 # ==================== 安装 Docker ====================
 install_docker() {
     if command -v docker &>/dev/null; then
@@ -239,6 +256,7 @@ install_docker() {
     fi
 
     echo -e "${CYAN}正在安装 Docker...${NC}"
+    wait_for_apt_lock
     if curl -fsSL https://get.docker.com | sh; then
         systemctl enable docker
         systemctl start docker
@@ -261,6 +279,7 @@ install_docker_compose() {
     fi
 
     echo -e "${CYAN}正在安装 Docker Compose 插件...${NC}"
+    wait_for_apt_lock
     apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null || {
         # fallback: 安装独立版本
         local version
@@ -350,6 +369,7 @@ install_fail2ban() {
     echo -e "${CYAN}配置 fail2ban (自动封禁暴力扫描IP)...${NC}"
 
     if ! command -v fail2ban-client &>/dev/null; then
+        wait_for_apt_lock
         apt-get update -qq && apt-get install -y fail2ban
     fi
 
