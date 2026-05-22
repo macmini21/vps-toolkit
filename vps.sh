@@ -25,6 +25,17 @@ SHADOW_TLS_PORT=443
 TLS_HOST="www.microsoft.com"
 METHOD="aes-256-gcm"
 
+# ==================== Docker Compose 命令检测 ====================
+get_compose_cmd() {
+    if docker compose version &>/dev/null; then
+        echo "docker compose"
+    elif command -v docker-compose &>/dev/null; then
+        echo "docker-compose"
+    else
+        echo ""
+    fi
+}
+
 # ==================== 权限检查 ====================
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -129,16 +140,23 @@ install_docker() {
 
 # ==================== 安装 Docker Compose ====================
 install_docker_compose() {
-    if command -v docker-compose &>/dev/null || docker compose version &>/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Docker Compose 已安装"
+    if docker compose version &>/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Docker Compose 已安装 (plugin)"
+        return
+    fi
+    if command -v docker-compose &>/dev/null; then
+        echo -e "${GREEN}✓${NC} Docker Compose 已安装 (standalone)"
         return
     fi
 
-    echo -e "${CYAN}正在安装 Docker Compose...${NC}"
-    local version
-    version=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    curl -L "https://github.com/docker/compose/releases/download/${version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
+    echo -e "${CYAN}正在安装 Docker Compose 插件...${NC}"
+    apt-get update -qq && apt-get install -y -qq docker-compose-plugin 2>/dev/null || {
+        # fallback: 安装独立版本
+        local version
+        version=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        curl -L "https://github.com/docker/compose/releases/download/${version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
+    }
     echo -e "${GREEN}✓${NC} Docker Compose 安装完成"
 }
 
@@ -316,16 +334,22 @@ EOF
     echo ""
     echo -e "${CYAN}正在拉取镜像并启动...${NC}"
     cd "$INSTALL_DIR"
-    docker-compose up -d
+    local compose_cmd
+    compose_cmd=$(get_compose_cmd)
+    if [ -z "$compose_cmd" ]; then
+        echo -e "${RED}Docker Compose 未找到${NC}"
+        return 1
+    fi
+    $compose_cmd up -d
 
     # 等待服务启动
     sleep 3
 
     # 检查服务状态
-    if docker-compose ps | grep -q "Up\|running"; then
+    if $compose_cmd ps | grep -q "Up\|running"; then
         echo -e "${GREEN}✓${NC} 服务启动成功"
     else
-        echo -e "${RED}✗ 服务启动失败，请检查日志: docker-compose -f $COMPOSE_FILE logs${NC}"
+        echo -e "${RED}✗ 服务启动失败，请检查日志: $compose_cmd -f $COMPOSE_FILE logs${NC}"
         return 1
     fi
 
@@ -392,7 +416,10 @@ uninstall_ssr() {
 
     echo -e "${CYAN}正在停止并删除容器...${NC}"
     cd "$INSTALL_DIR"
-    docker-compose down --rmi all 2>/dev/null || docker-compose down 2>/dev/null
+    local compose_cmd
+    compose_cmd=$(get_compose_cmd)
+    [ -z "$compose_cmd" ] && compose_cmd="docker compose"
+    $compose_cmd down --rmi all 2>/dev/null || $compose_cmd down 2>/dev/null
 
     echo -e "${CYAN}清理文件...${NC}"
     rm -rf "$INSTALL_DIR"
@@ -424,7 +451,10 @@ status_ssr() {
 
     cd "$INSTALL_DIR"
     echo -e "${BOLD}  容器状态:${NC}"
-    docker-compose ps
+    local compose_cmd
+    compose_cmd=$(get_compose_cmd)
+    [ -z "$compose_cmd" ] && compose_cmd="docker compose"
+    $compose_cmd ps
     echo ""
 
     if [ -f "$CONFIG_FILE" ]; then
