@@ -239,10 +239,14 @@ install_docker() {
     fi
 
     echo -e "${CYAN}正在安装 Docker...${NC}"
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker
-    systemctl start docker
-    echo -e "${GREEN}✓${NC} Docker 安装完成"
+    if curl -fsSL https://get.docker.com | sh; then
+        systemctl enable docker
+        systemctl start docker
+        echo -e "${GREEN}✓${NC} Docker 安装完成"
+    else
+        echo -e "${RED}✗ Docker 安装失败${NC}"
+        return 1
+    fi
 }
 
 # ==================== 安装 Docker Compose ====================
@@ -284,29 +288,19 @@ configure_firewall() {
         iptables -F
         iptables -X 2>/dev/null || true
 
-        # 设置默认策略: 出站允许，入站丢弃
+        # 先添加关键规则，再设置DROP策略 (防止SSH瞬断)
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+        iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+        iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: " --log-level 4
+
+        # 规则就绪后再设置默认策略
         iptables -P INPUT DROP
         iptables -P FORWARD DROP
         iptables -P OUTPUT ACCEPT
-
-        # 允许回环
-        iptables -A INPUT -i lo -j ACCEPT
-
-        # 允许已建立的连接
-        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-        # 允许 ICMP (ping)
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
-
-        # 允许 SSH
-        iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-
-        # 允许 Shadow-TLS 端口
-        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-
-        # 记录并丢弃其他
-        iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: " --log-level 4
 
         # 持久化规则
         apt-get install -y -qq iptables-persistent netfilter-persistent 2>/dev/null || true
@@ -329,14 +323,23 @@ configure_firewall() {
             [ -z "$ssh_port" ] && ssh_port=22
 
             iptables -F
-            iptables -P INPUT DROP
-            iptables -P FORWARD DROP
-            iptables -P OUTPUT ACCEPT
             iptables -A INPUT -i lo -j ACCEPT
             iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
             iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
             iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
             iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+            iptables -P INPUT DROP
+            iptables -P FORWARD DROP
+            iptables -P OUTPUT ACCEPT
+
+            # 持久化
+            apt-get install -y -qq iptables-persistent netfilter-persistent 2>/dev/null || true
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save
+            else
+                mkdir -p /etc/iptables
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            fi
             echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + Shadow-TLS(${port}) + ICMP"
         fi
     fi
