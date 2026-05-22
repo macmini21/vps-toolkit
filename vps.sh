@@ -110,15 +110,15 @@ generate_ss_link() {
     local tag="$4"
     local tls_host="$5"
 
-    # ss:// legacy格式: BASE64(method:password@host:port)
+    # ss:// legacy格式: BASE64(method:password@host:port), 去掉=填充
     local userinfo="${METHOD}:${password}@${ip}:${port}"
     local encoded
-    encoded=$(echo -n "$userinfo" | base64 -w 0)
+    encoded=$(echo -n "$userinfo" | base64 -w 0 | tr -d '=')
 
-    # shadow-tls JSON
+    # shadow-tls JSON, 去掉=填充
     local stls_json="{\"address\":\"${ip}\",\"password\":\"${password}\",\"port\":\"${port}\",\"host\":\"${tls_host}\",\"version\":\"2\"}"
     local stls_encoded
-    stls_encoded=$(echo -n "$stls_json" | base64 -w 0)
+    stls_encoded=$(echo -n "$stls_json" | base64 -w 0 | tr -d '=')
 
     # URL encode tag
     local tag_encoded
