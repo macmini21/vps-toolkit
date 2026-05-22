@@ -612,33 +612,38 @@ setup_oracle_keepalive() {
 
     cat > /opt/ssr/keepalive.sh << SCRIPT
 #!/bin/bash
-# Oracle Cloud 实例保活 - CPU负载生成 (自动适配)
-# 每10分钟运行, 目标CPU均值 12-15%
+# Oracle Cloud 实例保活 - CPU负载生成
 # 机器配置: ${cores}C / ${mem_mb}MB
-# 策略: ${workers} 并行 worker × ${duration}s
+# 策略: ${workers} workers × ${duration}s / 每10分钟
 
-# 防重入: 杀掉上一次残留进程
-pkill -f "keepalive_worker" 2>/dev/null || true
+# flock 防重入，确保不会有多个实例同时跑
+exec 200>/tmp/keepalive.lock
+flock -n 200 || exit 0
 
-# 随机延迟0-30秒，避免固定模式
+# 随机延迟0-30秒
 sleep \$(( RANDOM % 30 ))
 
 WORKERS=${workers}
 DURATION=${duration}
+PIDS=""
 
-# 启动 worker (nice 19, 不影响正常业务)
+# 启动 worker
 for i in \$(seq 1 \$WORKERS); do
-    bash -c 'exec -a keepalive_worker timeout '\$DURATION' nice -n 19 sh -c "while true; do :; done"' &
+    nice -n 19 yes >/dev/null &
+    PIDS="\$PIDS \$!"
 done
 
-wait
+# 精确计时后杀掉所有 worker
+sleep \$DURATION
+kill \$PIDS 2>/dev/null
+wait 2>/dev/null
 SCRIPT
     chmod +x /opt/ssr/keepalive.sh
 
-    # 只用 systemd timer 调度，移除旧 cron 条目（防止双重触发）
+    # 移除旧 cron 条目
     (crontab -l 2>/dev/null | grep -v "keepalive") | crontab - 2>/dev/null || true
 
-    # 创建 systemd 服务 (备份，防止cron失效)
+    # systemd 服务 + 硬超时保护
     cat > /etc/systemd/system/oracle-keepalive.service << 'EOF'
 [Unit]
 Description=Oracle Cloud Instance Keepalive
@@ -649,6 +654,9 @@ Type=oneshot
 ExecStart=/opt/ssr/keepalive.sh
 Nice=19
 CPUSchedulingPolicy=idle
+TimeoutSec=120
+KillMode=control-group
+KillSignal=SIGKILL
 EOF
 
     cat > /etc/systemd/system/oracle-keepalive.timer << 'EOF'
@@ -674,7 +682,7 @@ EOF
     echo -e "  • 策略: ${workers} workers × ${duration}s"
     echo -e "  • 优先级: nice 19 (最低，不影响正常业务)"
     echo -e "  • 预估CPU均值: 12-15%"
-    echo -e "  • 双保险: cron + systemd timer"
+    echo -e "  • 保护: flock防重入 + systemd 120s硬超时"
     echo ""
 }
 
