@@ -108,6 +108,7 @@ generate_ss_link() {
     local password="$2"
     local port="$3"
     local tag="$4"
+    local tls_host="$5"
 
     # ss:// legacy格式: BASE64(method:password@host:port)
     local userinfo="${METHOD}:${password}@${ip}:${port}"
@@ -115,7 +116,7 @@ generate_ss_link() {
     encoded=$(echo -n "$userinfo" | base64 -w 0)
 
     # shadow-tls JSON
-    local stls_json="{\"address\":\"${ip}\",\"password\":\"${password}\",\"port\":\"${port}\",\"host\":\"${TLS_HOST}\",\"version\":\"2\"}"
+    local stls_json="{\"address\":\"${ip}\",\"password\":\"${password}\",\"port\":\"${port}\",\"host\":\"${tls_host}\",\"version\":\"2\"}"
     local stls_encoded
     stls_encoded=$(echo -n "$stls_json" | base64 -w 0)
 
@@ -368,7 +369,7 @@ EOF
 
     # 生成链接
     local ss_link
-    ss_link=$(generate_ss_link "$public_ip" "$password" "$stls_port" "$node_name")
+    ss_link=$(generate_ss_link "$public_ip" "$password" "$stls_port" "$node_name" "$tls_host")
 
     # 保存配置
     cat > "$CONFIG_FILE" << EOF
