@@ -837,6 +837,21 @@ EOF
     echo -e "  TLS伪装:  ${BOLD}${tls_host}${NC}"
     echo -e "  平台:     ${BOLD}${platform}${NC}"
     echo ""
+
+    # 测速
+    echo -e "${CYAN}正在测速...${NC}"
+    local dl_speed
+    dl_speed=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 \
+        "https://speed.cloudflare.com/__down?bytes=104857600" 2>/dev/null)
+    if [ -n "$dl_speed" ] && [ "$dl_speed" != "0.000" ]; then
+        local dl_mbps
+        dl_mbps=$(echo "$dl_speed" | awk '{printf "%.0f", $1 * 8 / 1048576}')
+        echo -e "  带宽:     ${BOLD}${dl_mbps} Mbps${NC}"
+    else
+        echo -e "  带宽:     ${YELLOW}测试失败${NC}"
+    fi
+
+    echo ""
     echo -e "${CYAN}SS 链接 (复制到客户端导入):${NC}"
     echo ""
     echo -e "${GREEN}${ss_link}${NC}"
