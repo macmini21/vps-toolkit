@@ -613,9 +613,9 @@ setup_oracle_keepalive() {
     local cores
     cores=$(nproc)
     echo -e "  CPU核心数: ${BOLD}${cores}${NC}"
-    echo -e "  保活策略: stress-ng --cpu ${cores} --cpu-load 13"
+    echo -e "  保活策略: 每天 8 小时, 每核 35% 负载 (日均≈12%)"
 
-    # systemd 服务直接调用 stress-ng
+    # systemd 服务: 跑8小时后自动退出
     cat > /etc/systemd/system/oracle-keepalive.service << EOF
 [Unit]
 Description=Oracle Cloud Instance Keepalive (stress-ng)
@@ -623,18 +623,34 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$(which stress-ng) --cpu ${cores} --cpu-load 13 --timeout 0
-Restart=always
-RestartSec=10
+ExecStart=$(which stress-ng) --cpu ${cores} --cpu-load 35 --timeout 8h
 Nice=19
+KillSignal=SIGTERM
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # systemd timer: 每天凌晨2点启动, 随机延迟1小时
+    cat > /etc/systemd/system/oracle-keepalive.timer << 'EOF'
+[Unit]
+Description=Oracle Keepalive Daily Timer
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
     systemctl daemon-reload
-    systemctl enable oracle-keepalive.service
-    systemctl restart oracle-keepalive.service
+    systemctl enable oracle-keepalive.timer
+    systemctl start oracle-keepalive.timer
+    # 立即启动一次 (不等到明天凌晨)
+    systemctl start oracle-keepalive.service
 
     # 验证
     sleep 2
@@ -647,9 +663,10 @@ EOF
 
     echo ""
     echo -e "${GREEN}✓${NC} 保活已配置:"
-    echo -e "  • 工具: stress-ng (专业CPU负载工具)"
-    echo -e "  • 负载: 每核 13% (总计 ≈13%)"
-    echo -e "  • 优先级: nice 19 (最低)"
+    echo -e "  • 工具: stress-ng (精确CPU负载控制)"
+    echo -e "  • 时段: 每天 8 小时 (凌晨2点开始)"
+    echo -e "  • 负载: 每核 35% → 日均 ≈12%"
+    echo -e "  • 优先级: nice 19 (有其他任务时自动让出)"
     echo -e "  • 管理: systemctl stop/start oracle-keepalive"
     echo ""
 }
