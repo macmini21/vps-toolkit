@@ -6,7 +6,7 @@
 # 用法: bash vps.sh
 # ============================================================
 
-set -e
+# 不使用 set -e, 部分命令预期失败 (iptables -D 等)
 
 # ==================== 颜色定义 ====================
 RED='\033[0;31m'
@@ -14,6 +14,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 # ==================== 配置 ====================
@@ -85,10 +86,10 @@ detect_platform() {
 # ==================== 获取公网IP ====================
 get_public_ip() {
     local ip=""
-    ip=$(curl -s -m 5 ifconfig.me 2>/dev/null) ||
-    ip=$(curl -s -m 5 ipinfo.io/ip 2>/dev/null) ||
-    ip=$(curl -s -m 5 icanhazip.com 2>/dev/null) ||
-    ip=$(curl -s -m 5 api.ipify.org 2>/dev/null)
+    ip=$(curl -s -m 5 ifconfig.me 2>/dev/null) || true
+    [ -z "$ip" ] && ip=$(curl -s -m 5 ipinfo.io/ip 2>/dev/null) || true
+    [ -z "$ip" ] && ip=$(curl -s -m 5 icanhazip.com 2>/dev/null) || true
+    [ -z "$ip" ] && ip=$(curl -s -m 5 api.ipify.org 2>/dev/null) || true
 
     if [ -z "$ip" ]; then
         echo -e "${RED}无法获取公网IP${NC}" >&2
@@ -99,7 +100,12 @@ get_public_ip() {
 
 # ==================== 生成随机密码 ====================
 generate_password() {
-    openssl rand -base64 20 | tr -d '/+=' | head -c 20
+    local pw=""
+    # 循环确保至少20字符 (去除特殊字符后可能变短)
+    while [ ${#pw} -lt 20 ]; do
+        pw=$(openssl rand -base64 30 | tr -d '/+=\n' | head -c 20)
+    done
+    echo "$pw"
 }
 
 # ==================== 生成 ss:// 链接 ====================
@@ -120,9 +126,9 @@ generate_ss_link() {
     local stls_encoded
     stls_encoded=$(echo -n "$stls_json" | base64 -w 0 | tr -d '=')
 
-    # URL encode tag
+    # URL encode tag (安全: 用 stdin 传递避免命令注入)
     local tag_encoded
-    tag_encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$tag'))" 2>/dev/null || echo "$tag")
+    tag_encoded=$(printf '%s' "$tag" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read()))" 2>/dev/null || printf '%s' "$tag" | sed 's/ /%20/g; s/#/%23/g')
 
     echo "ss://${encoded}?tfo=1&shadow-tls=${stls_encoded}#${tag_encoded}"
 }
@@ -176,11 +182,9 @@ configure_firewall() {
         ssh_port=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP '\d+$' | head -1)
         [ -z "$ssh_port" ] && ssh_port=22
 
-        # 清除甲骨文默认的限制规则
+        # 清除甲骨文默认的限制规则 (不清nat/mangle, 保护Docker)
         iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t mangle -F
+        iptables -X 2>/dev/null || true
 
         # 设置默认策略: 出站允许，入站丢弃
         iptables -P INPUT DROP
@@ -410,40 +414,51 @@ setup_oracle_keepalive() {
     echo -e "${DIM}  原理: 定期产生CPU负载，保持7天均值 >10%${NC}"
     echo ""
 
-    # 检测CPU核心数，计算需要的负载时间
-    local cores
+    # 检测CPU核心数和内存，计算需要的负载参数
+    local cores mem_mb
     cores=$(nproc)
+    mem_mb=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
     echo -e "  CPU核心数: ${BOLD}${cores}${NC}"
+    echo -e "  内存大小:  ${BOLD}${mem_mb}MB${NC}"
 
-    # 目标: 维持约12-15%的CPU使用率
-    # 策略: 每10分钟跑一个CPU密集任务，持续约90秒
-    # 4核机器: 单核跑90秒 = 90/(600*4) ≈ 3.75% 单次
-    # 每10分钟跑一次: 占比约15%
+    # 目标: 维持约12-15%的 总CPU 使用率
+    # 公式: CPU% = (workers × duration) / (interval × cores)
+    # 策略: 每10分钟运行，启动 cores 个并行 worker 各跑 duration 秒
+    # 这样无论几核，CPU% = duration / interval = 75/600 ≈ 12.5%
+    local duration=75
+    local workers=$cores
 
-    local duration=90
-    if [ "$cores" -ge 4 ]; then
-        duration=90
-    elif [ "$cores" -ge 2 ]; then
-        duration=60
-    else
-        duration=45
+    # 低内存机器 (<=1GB) 限制并行数，避免 OOM
+    if [ "$mem_mb" -le 1024 ] && [ "$workers" -gt 2 ]; then
+        workers=2
+        duration=$(( 75 * cores / workers ))
+        # 上限180秒，防止任务重叠
+        [ "$duration" -gt 180 ] && duration=180
     fi
+
+    echo -e "  保活策略:  ${BOLD}${workers} workers × ${duration}s${NC} (目标≈12%)"
 
     cat > /opt/ssr/keepalive.sh << SCRIPT
 #!/bin/bash
-# Oracle Cloud 实例保活 - CPU负载生成
-# 每10分钟运行，产生足够CPU使用率防止回收
-# 核心数: ${cores}, 单次持续: ${duration}秒
+# Oracle Cloud 实例保活 - CPU负载生成 (自动适配)
+# 每10分钟运行, 目标CPU均值 12-15%
+# 机器配置: ${cores}C / ${mem_mb}MB
+# 策略: ${workers} 并行 worker × ${duration}s
 
 # 随机延迟0-30秒，避免固定模式
 sleep \$(( RANDOM % 30 ))
 
-# 单核CPU密集计算 (不影响正常使用)
-timeout ${duration} nice -n 19 dd if=/dev/urandom bs=1M count=1024 2>/dev/null | md5sum >/dev/null 2>&1 &
+WORKERS=${workers}
+DURATION=${duration}
 
-# 偶尔多跑一个核心 (随机化，更自然)
-if [ \$(( RANDOM % 3 )) -eq 0 ]; then
-    timeout $(( duration / 2 )) nice -n 19 sha256sum /dev/urandom >/dev/null 2>&1 &
+# 启动 worker (nice 19, 不影响正常业务)
+for i in \$(seq 1 \$WORKERS); do
+    timeout \$DURATION nice -n 19 sh -c 'while true; do :; done' &
+done
+
+# 偶尔额外增加一点 I/O 负载 (更自然的使用模式)
+if [ \$(( RANDOM % 4 )) -eq 0 ]; then
+    timeout \$(( DURATION / 3 )) nice -n 19 dd if=/dev/urandom bs=64K count=256 of=/dev/null 2>/dev/null &
 fi
 
 wait
@@ -487,7 +502,7 @@ EOF
     echo ""
     echo -e "${GREEN}✓${NC} 保活已配置:"
     echo -e "  • 频率: 每10分钟"
-    echo -e "  • 持续: ~${duration}秒/次"
+    echo -e "  • 策略: ${workers} workers × ${duration}s"
     echo -e "  • 优先级: nice 19 (最低，不影响正常业务)"
     echo -e "  • 预估CPU均值: 12-15%"
     echo -e "  • 双保险: cron + systemd timer"
@@ -593,8 +608,8 @@ install_ssr() {
     echo ""
 
     # 安装依赖
-    install_docker
-    install_docker_compose
+    install_docker || { echo -e "${RED}Docker 安装失败${NC}"; return 1; }
+    install_docker_compose || { echo -e "${RED}Docker Compose 安装失败${NC}"; return 1; }
 
     # 防火墙
     configure_firewall "$platform" "$stls_port"
