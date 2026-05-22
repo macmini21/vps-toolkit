@@ -166,33 +166,75 @@ install_docker_compose() {
 # ==================== 配置 iptables (仅 Oracle) ====================
 configure_firewall() {
     local platform="$1"
+    local port="$2"  # Shadow-TLS 端口
 
     if [ "$platform" = "oracle" ]; then
-        echo -e "${CYAN}检测到 Oracle Cloud，开放所有端口...${NC}"
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
+        echo -e "${CYAN}检测到 Oracle Cloud，配置防火墙...${NC}"
+
+        # 获取当前SSH端口
+        local ssh_port
+        ssh_port=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP '\d+$' | head -1)
+        [ -z "$ssh_port" ] && ssh_port=22
+
+        # 清除甲骨文默认的限制规则
         iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t mangle -F
+
+        # 设置默认策略: 出站允许，入站丢弃
+        iptables -P INPUT DROP
+        iptables -P FORWARD DROP
+        iptables -P OUTPUT ACCEPT
+
+        # 允许回环
+        iptables -A INPUT -i lo -j ACCEPT
+
+        # 允许已建立的连接
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+        # 允许 ICMP (ping)
+        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+        iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+
+        # 允许 SSH
+        iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+
+        # 允许 Shadow-TLS 端口
+        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+
+        # 记录并丢弃其他
+        iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: " --log-level 4
 
         # 持久化规则
         if command -v netfilter-persistent &>/dev/null; then
             netfilter-persistent save
-        elif command -v iptables-save &>/dev/null; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-            iptables-save > /etc/iptables.rules 2>/dev/null || true
+        else
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         fi
-        echo -e "${GREEN}✓${NC} iptables 已开放所有端口"
+
+        echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + Shadow-TLS(${port}) + ICMP"
     elif [ "$platform" = "azure" ]; then
         echo -e "${GREEN}✓${NC} Azure 平台，跳过 iptables 配置 (使用 NSG 管理)"
     else
-        echo -e "${YELLOW}未知平台，是否开放 iptables?${NC}"
+        echo -e "${YELLOW}未知平台，是否配置防火墙? (仅开放 SSH + 代理端口 + ping)${NC}"
         read -rp "[y/N]: " answer
         if [[ "$answer" =~ ^[Yy]$ ]]; then
-            iptables -P INPUT ACCEPT
-            iptables -P FORWARD ACCEPT
-            iptables -P OUTPUT ACCEPT
+            local ssh_port
+            ssh_port=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP '\d+$' | head -1)
+            [ -z "$ssh_port" ] && ssh_port=22
+
             iptables -F
-            echo -e "${GREEN}✓${NC} iptables 已开放"
+            iptables -P INPUT DROP
+            iptables -P FORWARD DROP
+            iptables -P OUTPUT ACCEPT
+            iptables -A INPUT -i lo -j ACCEPT
+            iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+            iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+            iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+            echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + Shadow-TLS(${port}) + ICMP"
         fi
     fi
 }
@@ -300,7 +342,7 @@ install_ssr() {
     install_docker_compose
 
     # 防火墙
-    configure_firewall "$platform"
+    configure_firewall "$platform" "$stls_port"
 
     # BBR
     enable_bbr
