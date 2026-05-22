@@ -586,6 +586,18 @@ setup_oracle_keepalive() {
     echo -e "${DIM}  原理: 定期产生CPU负载，保持7天均值 >10%${NC}"
     echo ""
 
+    # ====== 清理旧版本残留僵尸进程 ======
+    echo -e "${CYAN}清理旧版本残留进程...${NC}"
+    pkill -9 -f "while true; do :; done" 2>/dev/null || true
+    pkill -9 -f "while :; do :; done" 2>/dev/null || true
+    pkill -9 -f "keepalive_worker" 2>/dev/null || true
+    killall -9 yes 2>/dev/null || true
+    # 杀掉所有 nice 19 的 sh 进程 (旧保活遗留)
+    ps -eo pid,ni,comm --no-headers 2>/dev/null | awk '$2 == "19" && ($3 == "sh" || $3 == "bash") {print $1}' | xargs -r kill -9 2>/dev/null || true
+    # 移除旧 cron
+    (crontab -l 2>/dev/null | grep -v "keepalive") | crontab - 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} 旧进程已清理"
+
     # 检测CPU核心数和内存，计算需要的负载参数
     local cores mem_mb
     cores=$(nproc)
@@ -616,12 +628,15 @@ setup_oracle_keepalive() {
 # 机器配置: ${cores}C / ${mem_mb}MB
 # 策略: ${workers} workers × ${duration}s / 每10分钟
 
-# flock 防重入，确保不会有多个实例同时跑
+# flock 防重入
 exec 200>/tmp/keepalive.lock
 flock -n 200 || exit 0
 
-# 随机延迟0-30秒
-sleep \$(( RANDOM % 30 ))
+# 清理任何残留 (防止累积)
+killall -9 yes 2>/dev/null || true
+
+# 随机延迟0-20秒
+sleep \$(( RANDOM % 20 ))
 
 WORKERS=${workers}
 DURATION=${duration}
@@ -633,9 +648,9 @@ for i in \$(seq 1 \$WORKERS); do
     PIDS="\$PIDS \$!"
 done
 
-# 精确计时后杀掉所有 worker
+# 精确计时后 SIGKILL 所有 worker (SIGKILL 不可被忽略)
 sleep \$DURATION
-kill \$PIDS 2>/dev/null
+kill -9 \$PIDS 2>/dev/null
 wait 2>/dev/null
 SCRIPT
     chmod +x /opt/ssr/keepalive.sh
