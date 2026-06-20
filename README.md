@@ -31,12 +31,40 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/macmini21/vps-toolkit/main/vps.sh)
 ```
 
+### Azure + 中国大陆推荐用法
+
+大陆网络环境部署 Azure VM 时，建议显式指定平台和区域，脚本会启用大陆 apt/Docker 镜像、DNS/NTP、BBR/fq/MTU probing，并跳过本机 iptables 防火墙配置，改由 Azure NSG 管理。
+
+```bash
+sudo bash <(curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh) install --azure --cn
+```
+
+也可以使用等价快捷参数 `--azure-cn`。
+
+免交互安装可加 `--yes`，也可以用环境变量覆盖默认节点名、端口、TLS 伪装域名和 Docker 镜像站：
+
+```bash
+sudo env VPS_NODE_NAME="Azure-HK-01" \
+	VPS_STLS_PORT=443 \
+	VPS_TLS_HOST="www.microsoft.com" \
+	bash <(curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh) install --azure --cn --yes
+```
+
+如果默认 Docker Hub 镜像站不可用，可自定义：
+
+```bash
+sudo env VPS_DOCKER_MIRRORS="https://mirror1.example.com,https://mirror2.example.com" \
+	bash <(curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh) install --azure --cn --yes
+```
+
 ## 命令行模式
 
 ```bash
 sudo bash vps.sh install    # 直接安装
 sudo bash vps.sh uninstall  # 直接删除
 sudo bash vps.sh status     # 查看状态/链接
+sudo bash vps.sh install --azure --cn --yes  # Azure + 大陆免交互安装
+sudo bash vps.sh install --azure-cn --yes    # 同上，快捷写法
 ```
 
 ## 交互菜单

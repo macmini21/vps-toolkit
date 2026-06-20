@@ -2,8 +2,8 @@
 # ============================================================
 # VPS 一键工具箱
 # 功能: SSR(Shadowsocks + Shadow-TLS) 一键部署/删除
-# 兼容: Oracle Cloud / Azure / 通用VPS
-# 用法: bash vps.sh
+# 兼容: Azure / Oracle Cloud / 通用VPS
+# 用法: bash vps.sh install --azure --cn --yes
 # ============================================================
 
 # 不使用 set -e, 部分命令预期失败 (iptables -D 等)
@@ -28,12 +28,15 @@ TLS_HOST_ORACLE="www.apple.com"
 TLS_HOST_DEFAULT="www.apple.com"
 METHOD="aes-256-gcm"
 REGION_MODE="auto"  # auto|cn|global
+PLATFORM_MODE="auto"  # auto|azure|oracle|unknown
+AUTO_YES="${VPS_YES:-0}"
 
 # 大陆常用网络参数
 CN_DNS_PRIMARY="223.5.5.5"
 CN_DNS_SECONDARY="119.29.29.29"
 CN_APT_MIRROR_UBUNTU="mirrors.aliyun.com"
 CN_APT_MIRROR_DEBIAN="mirrors.aliyun.com"
+CN_DOCKER_MIRROR="mirrors.aliyun.com/docker-ce"
 
 # ==================== 命令重试 ====================
 retry_cmd() {
@@ -103,6 +106,20 @@ optimize_for_mainland() {
             sed -i -E "s|https?://deb\\.debian\\.org/debian|https://${CN_APT_MIRROR_DEBIAN}/debian|g" /etc/apt/sources.list
             sed -i -E "s|https?://security\\.debian\\.org/debian-security|https://${CN_APT_MIRROR_DEBIAN}/debian-security|g" /etc/apt/sources.list
         fi
+
+        # Ubuntu 22.04+/24.04 和新版 Debian 常使用 deb822 (*.sources) 格式
+        local source_file
+        for source_file in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$source_file" ] || continue
+            [ -f "${source_file}.vpsbak" ] || cp "$source_file" "${source_file}.vpsbak"
+            if [ "${ID:-}" = "ubuntu" ]; then
+                sed -i -E "s|https?://([a-zA-Z0-9.-]+\\.)?(archive|security|ports)\\.ubuntu\\.com/ubuntu/?|https://${CN_APT_MIRROR_UBUNTU}/ubuntu/|g" "$source_file"
+                sed -i -E "s|https?://azure\\.archive\\.ubuntu\\.com/ubuntu/?|https://${CN_APT_MIRROR_UBUNTU}/ubuntu/|g" "$source_file"
+            elif [ "${ID:-}" = "debian" ]; then
+                sed -i -E "s|https?://deb\\.debian\\.org/debian/?|https://${CN_APT_MIRROR_DEBIAN}/debian/|g" "$source_file"
+                sed -i -E "s|https?://security\\.debian\\.org/debian-security/?|https://${CN_APT_MIRROR_DEBIAN}/debian-security/|g" "$source_file"
+            fi
+        done
     fi
 
     # systemd-resolved DNS 优化
@@ -129,18 +146,32 @@ configure_docker_mirror() {
         cp /etc/docker/daemon.json /etc/docker/daemon.json.vpsbak
     fi
 
-    cat > /etc/docker/daemon.json << 'EOF'
+    local mirrors="${VPS_DOCKER_MIRRORS:-https://docker.1ms.run,https://docker.m.daocloud.io,https://dockerproxy.com,https://hub-mirror.c.163.com}"
+    local json_mirrors=""
+    local mirror
+    IFS=',' read -r -a mirror_list <<< "$mirrors"
+    for mirror in "${mirror_list[@]}"; do
+        mirror=$(echo "$mirror" | xargs)
+        [ -z "$mirror" ] && continue
+        if [ -n "$json_mirrors" ]; then
+            json_mirrors="${json_mirrors},"
+        fi
+        json_mirrors="${json_mirrors}
+    \"${mirror}\""
+    done
+
+    cat > /etc/docker/daemon.json << EOF
 {
-  "registry-mirrors": [
-    "https://dockerproxy.com",
-    "https://hub-mirror.c.163.com",
-    "https://docker.mirrors.ustc.edu.cn"
-  ]
+  "registry-mirrors": [${json_mirrors}
+  ],
+  "max-concurrent-downloads": 3,
+  "max-concurrent-uploads": 3
 }
 EOF
 
     systemctl daemon-reload
     systemctl restart docker 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} Docker 镜像加速已配置"
 }
 
 # ==================== Docker Compose 命令检测 ====================
@@ -164,6 +195,22 @@ check_root() {
 
 # ==================== 平台检测 ====================
 detect_platform() {
+    # 允许外部指定: VPS_PLATFORM=azure/oracle/unknown 或命令行 --azure/--oracle
+    case "${VPS_PLATFORM:-$PLATFORM_MODE}" in
+        azure|AZURE|Azure)
+            echo "azure"
+            return
+            ;;
+        oracle|oci|ORACLE|OCI)
+            echo "oracle"
+            return
+            ;;
+        unknown|generic)
+            echo "unknown"
+            return
+            ;;
+    esac
+
     # 尝试通过 metadata 检测
     if curl -s -m 3 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null | grep -qi "azure"; then
         echo "azure"
@@ -199,9 +246,34 @@ detect_platform() {
 }
 
 # ==================== 获取公网IP ====================
+get_azure_public_ip() {
+    local metadata
+    metadata=$(curl -s -m 3 -H "Metadata:true" "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01" 2>/dev/null) || true
+    [ -z "$metadata" ] && return 1
+
+    printf '%s' "$metadata" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for iface in data.get("interface", []):
+        for ip in iface.get("ipv4", {}).get("ipAddress", []):
+            public_ip = ip.get("publicIpAddress", "")
+            if public_ip:
+                print(public_ip)
+                raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+' 2>/dev/null
+}
+
 get_public_ip() {
+    local platform="${1:-unknown}"
     local ip=""
-    ip=$(curl -s -m 5 ip.sb 2>/dev/null) || true
+    if [ "$platform" = "azure" ]; then
+        ip=$(get_azure_public_ip) || true
+    fi
+    [ -z "$ip" ] && ip=$(curl -s -m 5 ip.sb 2>/dev/null) || true
     [ -z "$ip" ] && ip=$(curl -s -m 5 myip.ipip.net 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1) || true
     [ -z "$ip" ] && ip=$(curl -s -m 5 ifconfig.me 2>/dev/null) || true
     [ -z "$ip" ] && ip=$(curl -s -m 5 ipinfo.io/ip 2>/dev/null) || true
@@ -412,8 +484,55 @@ wait_for_apt_lock() {
     done
 }
 
+# ==================== 基础依赖 ====================
+install_base_dependencies() {
+    echo -e "${CYAN}安装基础依赖...${NC}"
+    wait_for_apt_lock
+    retry_cmd 3 apt-get update -qq || true
+    apt-get install -y -qq curl ca-certificates openssl python3 bc iproute2 iptables gnupg lsb-release >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓${NC} 基础依赖已就绪"
+}
+
 # ==================== 安装 Docker ====================
+configure_docker_apt_repo() {
+    local region="${1:-global}"
+
+    if [ ! -f /etc/os-release ]; then
+        return 1
+    fi
+    . /etc/os-release
+
+    local os_id="${ID:-}"
+    local codename="${VERSION_CODENAME:-}"
+    [ -z "$codename" ] && codename=$(lsb_release -cs 2>/dev/null || true)
+    if [ -z "$os_id" ] || [ -z "$codename" ]; then
+        return 1
+    fi
+    if [ "$os_id" != "ubuntu" ] && [ "$os_id" != "debian" ]; then
+        return 1
+    fi
+
+    local repo_base="https://download.docker.com/linux/${os_id}"
+    if [ "$region" = "cn" ]; then
+        repo_base="https://${CN_DOCKER_MIRROR}/linux/${os_id}"
+    fi
+
+    install -m 0755 -d /etc/apt/keyrings
+    if ! retry_cmd 3 curl -fsSL "${repo_base}/gpg" -o /etc/apt/keyrings/docker.asc; then
+        return 1
+    fi
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    local arch
+    arch=$(dpkg --print-architecture)
+    cat > /etc/apt/sources.list.d/docker.list << EOF
+deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] ${repo_base} ${codename} stable
+EOF
+}
+
 install_docker() {
+    local region="${1:-global}"
+
     if command -v docker &>/dev/null; then
         echo -e "${GREEN}✓${NC} Docker 已安装"
         return
@@ -425,6 +544,16 @@ install_docker() {
     # 修复可能损坏的 dpkg 状态
     dpkg --configure -a 2>/dev/null || true
     apt-get install -f -y 2>/dev/null || true
+    retry_cmd 3 apt-get update -qq || true
+    apt-get install -y -qq ca-certificates curl gnupg lsb-release >/dev/null 2>&1 || true
+
+    if configure_docker_apt_repo "$region" && retry_cmd 3 apt-get update -qq && \
+       apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+        systemctl enable docker
+        systemctl start docker
+        echo -e "${GREEN}✓${NC} Docker 安装完成 (APT源: ${region})"
+        return 0
+    fi
 
     if retry_cmd 3 bash -c "curl -fsSL https://get.docker.com | sh"; then
         systemctl enable docker
@@ -970,26 +1099,43 @@ install_ssr() {
     esac
 
     # 获取节点名称
-    read -rp "输入节点名称 (用于标识，如 东京01): " node_name
-    [ -z "$node_name" ] && node_name="VPS-$(date +%s | tail -c 5)"
+    local node_name="${VPS_NODE_NAME:-}"
+    if [ -z "$node_name" ] && [ "$AUTO_YES" != "1" ]; then
+        read -rp "输入节点名称 (用于标识，如 Azure-HK-01): " node_name
+    fi
+    if [ -z "$node_name" ]; then
+        if [ "$platform" = "azure" ]; then
+            node_name="Azure-$(date +%m%d%H%M)"
+        else
+            node_name="VPS-$(date +%s | tail -c 5)"
+        fi
+    fi
 
     # 自定义端口
-    local stls_port=$SHADOW_TLS_PORT
-    read -rp "Shadow-TLS 监听端口 [默认 443]: " custom_port
-    [ -n "$custom_port" ] && stls_port=$custom_port
+    local stls_port="${VPS_STLS_PORT:-$SHADOW_TLS_PORT}"
+    local custom_port=""
+    if [ "$AUTO_YES" != "1" ] && [ -z "${VPS_STLS_PORT:-}" ]; then
+        read -rp "Shadow-TLS 监听端口 [默认 443]: " custom_port
+        [ -n "$custom_port" ] && stls_port=$custom_port
+    fi
 
     # 自定义TLS伪装域名
-    local tls_host=$default_tls
-    read -rp "TLS 伪装域名 [默认 ${default_tls}]: " custom_tls
-    [ -n "$custom_tls" ] && tls_host=$custom_tls
+    local tls_host="${VPS_TLS_HOST:-$default_tls}"
+    local custom_tls=""
+    if [ "$AUTO_YES" != "1" ] && [ -z "${VPS_TLS_HOST:-}" ]; then
+        read -rp "TLS 伪装域名 [默认 ${default_tls}]: " custom_tls
+        [ -n "$custom_tls" ] && tls_host=$custom_tls
+    fi
 
     echo ""
 
     # 系统安全加固 (更新+SSH+内核+清理)
     harden_system
 
+    install_base_dependencies
+
     # 安装依赖
-    install_docker || { echo -e "${RED}Docker 安装失败${NC}"; return 1; }
+    install_docker "$region" || { echo -e "${RED}Docker 安装失败${NC}"; return 1; }
     configure_docker_mirror "$region"
     install_docker_compose || { echo -e "${RED}Docker Compose 安装失败${NC}"; return 1; }
 
@@ -1021,7 +1167,7 @@ install_ssr() {
 
     # 获取公网IP
     local public_ip
-    public_ip=$(get_public_ip)
+    public_ip=$(get_public_ip "$platform")
 
     # 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" << EOF
@@ -1201,6 +1347,7 @@ status_ssr() {
         echo -e "  节点名称: ${BOLD}${NODE_NAME}${NC}"
         echo -e "  服务器IP: ${BOLD}${PUBLIC_IP}${NC}"
         echo -e "  端口:     ${BOLD}${STLS_PORT}${NC}"
+        [ -n "${PLATFORM:-}" ] && echo -e "  平台:     ${BOLD}${PLATFORM}${NC}"
         [ -n "${REGION:-}" ] && echo -e "  区域模式: ${BOLD}${REGION}${NC}"
         echo -e "  安装时间: ${BOLD}${INSTALL_DATE}${NC}"
         echo ""
@@ -1308,16 +1455,34 @@ main() {
     check_root
     local cmd=""
 
-    # 区域参数: 支持 --cn / --global
+    case "$AUTO_YES" in
+        1|yes|YES|true|TRUE|y|Y) AUTO_YES="1" ;;
+        *) AUTO_YES="0" ;;
+    esac
+
+    # 快捷参数: 支持 --azure / --cn / --yes
     for arg in "$@"; do
         case "$arg" in
+            --azure-cn|--cn-azure)
+                PLATFORM_MODE="azure"
+                REGION_MODE="cn"
+                ;;
+            --azure)
+                PLATFORM_MODE="azure"
+                ;;
+            --oracle|--oci)
+                PLATFORM_MODE="oracle"
+                ;;
             --cn|--china)
                 REGION_MODE="cn"
                 ;;
             --global|--intl)
                 REGION_MODE="global"
                 ;;
-            install|uninstall|remove|status)
+            --yes|-y)
+                AUTO_YES="1"
+                ;;
+            install|uninstall|remove|status|link)
                 [ -z "$cmd" ] && cmd="$arg"
                 ;;
         esac
@@ -1340,7 +1505,16 @@ main() {
             1) install_ssr ;;
             2) uninstall_ssr ;;
             3) status_ssr ;;
-            4) optimize_network_performance ;;
+            4)
+                local platform region
+                platform=$(detect_platform)
+                if [ "$REGION_MODE" = "auto" ]; then
+                    region=$(detect_region)
+                else
+                    region="$REGION_MODE"
+                fi
+                optimize_network_performance "$platform" "$region"
+                ;;
             5) install_fail2ban ;;
             6) setup_abuse_protection ;;
             7) setup_oracle_keepalive ;;
