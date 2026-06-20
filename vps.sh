@@ -27,6 +27,121 @@ TLS_HOST_AZURE="www.microsoft.com"
 TLS_HOST_ORACLE="www.apple.com"
 TLS_HOST_DEFAULT="www.apple.com"
 METHOD="aes-256-gcm"
+REGION_MODE="auto"  # auto|cn|global
+
+# 大陆常用网络参数
+CN_DNS_PRIMARY="223.5.5.5"
+CN_DNS_SECONDARY="119.29.29.29"
+CN_APT_MIRROR_UBUNTU="mirrors.aliyun.com"
+CN_APT_MIRROR_DEBIAN="mirrors.aliyun.com"
+
+# ==================== 命令重试 ====================
+retry_cmd() {
+    local retries="${1:-3}"
+    shift
+    local count=1
+    while [ "$count" -le "$retries" ]; do
+        if "$@"; then
+            return 0
+        fi
+        count=$((count + 1))
+        sleep 2
+    done
+    return 1
+}
+
+# ==================== 区域检测 (大陆/国际) ====================
+detect_region() {
+    # 允许外部指定: VPS_REGION=cn 或 VPS_REGION=global
+    case "${VPS_REGION:-}" in
+        cn|CN|china|mainland)
+            echo "cn"
+            return
+            ;;
+        global|intl|overseas)
+            echo "global"
+            return
+            ;;
+    esac
+
+    # 简单网络特征判断: 百度可达 + Google 204 不可达 -> 大陆网络
+    if curl -sI --max-time 3 http://www.baidu.com >/dev/null 2>&1 && \
+       ! curl -sI --max-time 3 https://www.gstatic.com/generate_204 >/dev/null 2>&1; then
+        echo "cn"
+    else
+        echo "global"
+    fi
+}
+
+# ==================== 配置 APT 网络重试 ====================
+configure_apt_network() {
+    cat > /etc/apt/apt.conf.d/99vps-toolkit-network << 'EOF'
+Acquire::Retries "5";
+Acquire::http::Timeout "15";
+Acquire::https::Timeout "20";
+Acquire::ForceIPv4 "true";
+Dpkg::Use-Pty "0";
+EOF
+}
+
+# ==================== 大陆模式优化 ====================
+optimize_for_mainland() {
+    echo -e "${CYAN}应用中国大陆网络优化...${NC}"
+
+    configure_apt_network
+
+    # Ubuntu/Debian 软件源切换到大陆镜像 (保留备份)
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [ -f /etc/apt/sources.list ] && [ ! -f /etc/apt/sources.list.vpsbak ]; then
+            cp /etc/apt/sources.list /etc/apt/sources.list.vpsbak
+        fi
+
+        if [ "${ID:-}" = "ubuntu" ] && [ -f /etc/apt/sources.list ]; then
+            sed -i -E "s|https?://(archive|security)\\.ubuntu\\.com/ubuntu/?|https://${CN_APT_MIRROR_UBUNTU}/ubuntu/|g" /etc/apt/sources.list
+        elif [ "${ID:-}" = "debian" ] && [ -f /etc/apt/sources.list ]; then
+            sed -i -E "s|https?://deb\\.debian\\.org/debian|https://${CN_APT_MIRROR_DEBIAN}/debian|g" /etc/apt/sources.list
+            sed -i -E "s|https?://security\\.debian\\.org/debian-security|https://${CN_APT_MIRROR_DEBIAN}/debian-security|g" /etc/apt/sources.list
+        fi
+    fi
+
+    # systemd-resolved DNS 优化
+    if [ -f /etc/systemd/resolved.conf ]; then
+        sed -i -E 's/^#?DNS=.*/DNS=223.5.5.5 119.29.29.29/' /etc/systemd/resolved.conf
+        sed -i -E 's/^#?FallbackDNS=.*/FallbackDNS=8.8.8.8 1.1.1.1/' /etc/systemd/resolved.conf
+        systemctl restart systemd-resolved 2>/dev/null || true
+    fi
+
+    # 启用 NTP 防止时间漂移导致 TLS 问题
+    timedatectl set-ntp true 2>/dev/null || true
+
+    echo -e "${GREEN}✓${NC} 大陆网络优化已应用 (镜像源/DNS/重试/NTP)"
+}
+
+# ==================== Docker 镜像加速 ====================
+configure_docker_mirror() {
+    local region="$1"
+    [ "$region" != "cn" ] && return 0
+
+    mkdir -p /etc/docker
+
+    if [ -f /etc/docker/daemon.json ] && [ ! -f /etc/docker/daemon.json.vpsbak ]; then
+        cp /etc/docker/daemon.json /etc/docker/daemon.json.vpsbak
+    fi
+
+    cat > /etc/docker/daemon.json << 'EOF'
+{
+  "registry-mirrors": [
+    "https://dockerproxy.com",
+    "https://hub-mirror.c.163.com",
+    "https://docker.mirrors.ustc.edu.cn"
+  ]
+}
+EOF
+
+    systemctl daemon-reload
+    systemctl restart docker 2>/dev/null || true
+}
 
 # ==================== Docker Compose 命令检测 ====================
 get_compose_cmd() {
@@ -86,7 +201,9 @@ detect_platform() {
 # ==================== 获取公网IP ====================
 get_public_ip() {
     local ip=""
-    ip=$(curl -s -m 5 ifconfig.me 2>/dev/null) || true
+    ip=$(curl -s -m 5 ip.sb 2>/dev/null) || true
+    [ -z "$ip" ] && ip=$(curl -s -m 5 myip.ipip.net 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1) || true
+    [ -z "$ip" ] && ip=$(curl -s -m 5 ifconfig.me 2>/dev/null) || true
     [ -z "$ip" ] && ip=$(curl -s -m 5 ipinfo.io/ip 2>/dev/null) || true
     [ -z "$ip" ] && ip=$(curl -s -m 5 icanhazip.com 2>/dev/null) || true
     [ -z "$ip" ] && ip=$(curl -s -m 5 api.ipify.org 2>/dev/null) || true
@@ -131,6 +248,29 @@ generate_ss_link() {
     tag_encoded=$(printf '%s' "$tag" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read()))" 2>/dev/null || printf '%s' "$tag" | sed 's/ /%20/g; s/#/%23/g')
 
     echo "ss://${encoded}?tfo=1&shadow-tls=${stls_encoded}#${tag_encoded}"
+}
+
+# ==================== 输出 SS 链接 ====================
+print_ss_link() {
+    echo ""
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}未找到配置，SSR 可能尚未安装${NC}"
+        return 1
+    fi
+
+    source "$CONFIG_FILE"
+    if [ -z "${SS_LINK:-}" ]; then
+        echo -e "${RED}配置中未找到 SS_LINK${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}SS 链接:${NC}"
+    echo -e "${GREEN}${SS_LINK}${NC}"
+    echo ""
+    # 纯文本行，便于脚本调用方稳定提取
+    echo "SS_LINK=${SS_LINK}"
+    echo ""
+    return 0
 }
 
 # ==================== 系统安全加固 ====================
@@ -286,7 +426,7 @@ install_docker() {
     dpkg --configure -a 2>/dev/null || true
     apt-get install -f -y 2>/dev/null || true
 
-    if curl -fsSL https://get.docker.com | sh; then
+    if retry_cmd 3 bash -c "curl -fsSL https://get.docker.com | sh"; then
         systemctl enable docker
         systemctl start docker
         echo -e "${GREEN}✓${NC} Docker 安装完成"
@@ -295,8 +435,8 @@ install_docker() {
         echo -e "${YELLOW}首次安装失败，修复后重试...${NC}"
         wait_for_apt_lock
         dpkg --configure -a 2>/dev/null || true
-        apt-get update
-        if curl -fsSL https://get.docker.com | sh; then
+        retry_cmd 3 apt-get update
+        if retry_cmd 3 bash -c "curl -fsSL https://get.docker.com | sh"; then
             systemctl enable docker
             systemctl start docker
             echo -e "${GREEN}✓${NC} Docker 安装完成 (重试成功)"
@@ -320,14 +460,22 @@ install_docker_compose() {
 
     echo -e "${CYAN}正在安装 Docker Compose 插件...${NC}"
     wait_for_apt_lock
-    apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null || {
+    retry_cmd 3 apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null || {
         # fallback: 安装独立版本
         local version
         version=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        curl -L "https://github.com/docker/compose/releases/download/${version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
+        if [ -n "$version" ]; then
+            retry_cmd 3 curl -L "https://github.com/docker/compose/releases/download/${version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || \
+            retry_cmd 3 curl -L "https://ghfast.top/https://github.com/docker/compose/releases/download/${version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+        fi
     }
-    echo -e "${GREEN}✓${NC} Docker Compose 安装完成"
+    if docker compose version &>/dev/null 2>&1 || command -v docker-compose &>/dev/null; then
+        echo -e "${GREEN}✓${NC} Docker Compose 安装完成"
+    else
+        echo -e "${RED}✗ Docker Compose 安装失败${NC}"
+        return 1
+    fi
 }
 
 # ==================== 配置 iptables (仅 Oracle) ====================
@@ -373,6 +521,7 @@ configure_firewall() {
         echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + Shadow-TLS(${port}) + ICMP"
     elif [ "$platform" = "azure" ]; then
         echo -e "${GREEN}✓${NC} Azure 平台，跳过 iptables 配置 (使用 NSG 管理)"
+        echo -e "${YELLOW}提示: 请确认 Azure NSG 已放行 TCP ${port} 与 SSH 端口${NC}"
     else
         echo -e "${YELLOW}未知平台，是否配置防火墙? (仅开放 SSH + 代理端口 + ping)${NC}"
         read -rp "[y/N]: " answer
@@ -671,29 +820,82 @@ EOF
     echo ""
 }
 
-# ==================== 优化 BBR ====================
-enable_bbr() {
-    echo -e "${CYAN}启用 BBR 拥塞控制...${NC}"
+# ==================== 网络性能优化 ====================
+optimize_network_performance() {
+    local platform="${1:-unknown}"
+    local region="${2:-global}"
 
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ 网络性能优化 (稳速优先) ━━━${NC}"
+
+    # 确保 BBR 模块可用
     if ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
         modprobe tcp_bbr 2>/dev/null || true
     fi
 
-    cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
+    # 针对跨境链路和抖动优化: 增大缓冲、启用 MTU 自适应、减少短连接抖动
+    cat > /etc/sysctl.d/99-net-performance.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 131072 16777216
-net.ipv4.tcp_wmem = 4096 131072 16777216
+
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_max_syn_backlog = 8192
+
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 262144 33554432
+net.ipv4.tcp_wmem = 4096 262144 33554432
+
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
 EOF
 
+    # 大陆访问国际链路时，部分中间设备对 ECN 兼容性较差，关闭可提升稳定性
+    if [ "$region" = "cn" ]; then
+        echo "net.ipv4.tcp_ecn = 0" >> /etc/sysctl.d/99-net-performance.conf
+    fi
+
     sysctl --system >/dev/null 2>&1
+
+    # 识别默认出口网卡并优化队列
+    local default_if
+    default_if=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [ -n "$default_if" ]; then
+        ip link set dev "$default_if" txqueuelen 10000 2>/dev/null || true
+        tc qdisc replace dev "$default_if" root fq 2>/dev/null || true
+    fi
+
+    # Azure 网络栈上开启 fq 后通常更稳，这里保留提示信息
+    if [ "$platform" = "azure" ]; then
+        echo -e "${GREEN}✓${NC} Azure 网络优化已应用 (BBR + fq + MTU probing)"
+    else
+        echo -e "${GREEN}✓${NC} 网络优化已应用 (BBR + fq + MTU probing)"
+    fi
+
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    echo -e "${GREEN}✓${NC} BBR 已启用 (当前: $cc)"
+    local ecn
+    ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)
+    echo -e "  拥塞控制: ${BOLD}${cc:-unknown}${NC}"
+    echo -e "  默认网卡: ${BOLD}${default_if:-unknown}${NC}"
+    echo -e "  TCP ECN:  ${BOLD}${ecn:-unknown}${NC}"
+    echo ""
+}
+
+# 兼容旧菜单/调用
+enable_bbr() {
+    optimize_network_performance "unknown" "global"
 }
 
 # ==================== 关闭密码登录 ====================
@@ -743,7 +945,21 @@ install_ssr() {
     local platform
     platform=$(detect_platform)
     echo -e "${GREEN}✓${NC} 平台: ${BOLD}${platform}${NC}"
+
+    local region
+    if [ "$REGION_MODE" = "auto" ]; then
+        region=$(detect_region)
+    else
+        region="$REGION_MODE"
+    fi
+    echo -e "${GREEN}✓${NC} 网络区域: ${BOLD}${region}${NC}"
     echo ""
+
+    if [ "$region" = "cn" ]; then
+        optimize_for_mainland
+    else
+        configure_apt_network
+    fi
 
     # 根据平台选择默认TLS域名
     local default_tls
@@ -774,13 +990,14 @@ install_ssr() {
 
     # 安装依赖
     install_docker || { echo -e "${RED}Docker 安装失败${NC}"; return 1; }
+    configure_docker_mirror "$region"
     install_docker_compose || { echo -e "${RED}Docker Compose 安装失败${NC}"; return 1; }
 
     # 防火墙
     configure_firewall "$platform" "$stls_port"
 
-    # BBR
-    enable_bbr
+    # 网络优化 (稳速优先)
+    optimize_network_performance "$platform" "$region"
 
     # fail2ban
     install_fail2ban
@@ -864,6 +1081,7 @@ EOF
     # 保存配置
     cat > "$CONFIG_FILE" << EOF
 PLATFORM="${platform}"
+REGION="${region}"
 PUBLIC_IP="${public_ip}"
 PASSWORD="${password}"
 SS_PORT="${SS_PORT}"
@@ -889,6 +1107,7 @@ EOF
     echo -e "  加密方式: ${BOLD}${METHOD}${NC}"
     echo -e "  TLS伪装:  ${BOLD}${tls_host}${NC}"
     echo -e "  平台:     ${BOLD}${platform}${NC}"
+    echo -e "  区域模式: ${BOLD}${region}${NC}"
     echo ""
 
     # 测速
@@ -896,9 +1115,11 @@ EOF
     local dl_speed="" dl_mbps="0"
     # 依次尝试多个测速源
     for url in \
+        "https://speed.cloudflare.com/__down?bytes=52428800" \
+        "http://speedtest.cn-hangzhou.aliyuncs.com/10MB.zip" \
+        "http://speedtest1.online.telia.com/10MB.zip" \
         "http://cachefly.cachefly.net/100mb.test" \
         "http://speedtest.tele2.net/10MB.zip" \
-        "https://speed.cloudflare.com/__down?bytes=52428800" \
         "http://proof.ovh.net/files/10Mb.dat"; do
         dl_speed=$(curl -sL -o /dev/null -w '%{speed_download}' --max-time 12 "$url" 2>/dev/null)
         if [ -n "$dl_speed" ] && (( $(echo "$dl_speed > 1000" | bc -l 2>/dev/null || echo 0) )); then
@@ -916,6 +1137,8 @@ EOF
     echo -e "${CYAN}SS 链接 (复制到客户端导入):${NC}"
     echo ""
     echo -e "${GREEN}${ss_link}${NC}"
+    echo ""
+    echo "SS_LINK=${ss_link}"
     echo ""
 }
 
@@ -978,6 +1201,7 @@ status_ssr() {
         echo -e "  节点名称: ${BOLD}${NODE_NAME}${NC}"
         echo -e "  服务器IP: ${BOLD}${PUBLIC_IP}${NC}"
         echo -e "  端口:     ${BOLD}${STLS_PORT}${NC}"
+        [ -n "${REGION:-}" ] && echo -e "  区域模式: ${BOLD}${REGION}${NC}"
         echo -e "  安装时间: ${BOLD}${INSTALL_DATE}${NC}"
         echo ""
     fi
@@ -991,8 +1215,7 @@ status_ssr() {
     echo ""
 
     if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${CYAN}SS 链接:${NC}"
-        echo -e "${GREEN}${SS_LINK}${NC}"
+        print_ss_link
     fi
     echo ""
 }
@@ -1007,9 +1230,11 @@ speed_test() {
     echo -e "${CYAN}测试下载速度...${NC}"
     local dl_result="" dl_mbps="0"
     for url in \
+        "http://speedtest.cn-hangzhou.aliyuncs.com/100MB.zip" \
+        "http://speedtest1.online.telia.com/100MB.zip" \
+        "https://speed.cloudflare.com/__down?bytes=104857600" \
         "http://cachefly.cachefly.net/100mb.test" \
         "http://speedtest.tele2.net/10MB.zip" \
-        "https://speed.cloudflare.com/__down?bytes=104857600" \
         "http://proof.ovh.net/files/100Mb.dat"; do
         dl_result=$(curl -sL -o /dev/null -w '%{speed_download}' --max-time 15 "$url" 2>/dev/null)
         if [ -n "$dl_result" ] && (( $(echo "$dl_result > 1000" | bc -l 2>/dev/null || echo 0) )); then
@@ -1068,11 +1293,12 @@ show_menu() {
     echo -e "  ${GREEN}1)${NC} 安装 SSR (Shadowsocks + Shadow-TLS)"
     echo -e "  ${GREEN}2)${NC} 删除 SSR"
     echo -e "  ${GREEN}3)${NC} 查看 SSR 状态/链接"
-    echo -e "  ${GREEN}4)${NC} 优化网络 (BBR)"
+    echo -e "  ${GREEN}4)${NC} 优化网络 (稳速优先)"
     echo -e "  ${GREEN}5)${NC} 安装 fail2ban (封禁暴力扫描IP)"
     echo -e "  ${GREEN}6)${NC} SSR 防滥用保护 (限连接/限流量)"
     echo -e "  ${GREEN}7)${NC} Oracle Cloud 保活 (防停机回收)"
     echo -e "  ${GREEN}8)${NC} 网络测速 (检测带宽限速)"
+    echo -e "  ${GREEN}9)${NC} 仅输出 SS 链接 (便于复制)"
     echo -e "  ${GREEN}0)${NC} 退出"
     echo ""
 }
@@ -1080,28 +1306,46 @@ show_menu() {
 # ==================== 入口 ====================
 main() {
     check_root
+    local cmd=""
+
+    # 区域参数: 支持 --cn / --global
+    for arg in "$@"; do
+        case "$arg" in
+            --cn|--china)
+                REGION_MODE="cn"
+                ;;
+            --global|--intl)
+                REGION_MODE="global"
+                ;;
+            install|uninstall|remove|status)
+                [ -z "$cmd" ] && cmd="$arg"
+                ;;
+        esac
+    done
 
     # 支持直接命令
-    case "${1:-}" in
+    case "${cmd:-${1:-}}" in
         install) install_ssr; exit 0 ;;
         uninstall|remove) uninstall_ssr; exit 0 ;;
         status) status_ssr; exit 0 ;;
+        link) print_ss_link; exit $? ;;
         *) ;;
     esac
 
     # 交互式菜单
     while true; do
         show_menu
-        read -rp "请选择 [0-8]: " choice
+        read -rp "请选择 [0-9]: " choice
         case "$choice" in
             1) install_ssr ;;
             2) uninstall_ssr ;;
             3) status_ssr ;;
-            4) enable_bbr ;;
+            4) optimize_network_performance ;;
             5) install_fail2ban ;;
             6) setup_abuse_protection ;;
             7) setup_oracle_keepalive ;;
             8) speed_test ;;
+            9) print_ss_link ;;
             0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
