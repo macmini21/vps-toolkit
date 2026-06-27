@@ -351,7 +351,20 @@ generate_hy2_link() {
 
 hy2_udp_listening() {
     local port="$1"
-    ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"
+    [ -z "$port" ] && return 1
+
+    if ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .; then
+        return 0
+    fi
+
+    ss -H -lun 2>/dev/null | awk -v port="$port" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ (":" port "$")) found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
 }
 
 print_hy2_diagnostics() {
