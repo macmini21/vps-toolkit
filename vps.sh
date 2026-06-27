@@ -343,7 +343,40 @@ generate_hy2_link() {
     password_encoded=$(url_encode "$password")
     tag_encoded=$(url_encode "$tag")
 
-    echo "hysteria2://${password_encoded}@${ip}:${port}/?sni=${sni}&insecure=1#${tag_encoded}"
+    local sni_encoded
+    sni_encoded=$(url_encode "$sni")
+
+    echo "hysteria2://${password_encoded}@${ip}:${port}/?sni=${sni_encoded}&insecure=1#${tag_encoded}"
+}
+
+hy2_udp_listening() {
+    local port="$1"
+    ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"
+}
+
+print_hy2_diagnostics() {
+    local port="${1:-443}"
+    local platform="${2:-unknown}"
+    local compose_cmd
+
+    echo ""
+    echo -e "${BOLD}  HY2 诊断:${NC}"
+    if hy2_udp_listening "$port"; then
+        echo -e "  UDP监听: ${GREEN}正常${NC} (:${port})"
+    else
+        echo -e "  UDP监听: ${RED}未检测到${NC} (:${port})"
+    fi
+
+    if [ "$platform" = "azure" ]; then
+        echo -e "  Azure NSG: 请确认入站规则已放行 ${BOLD}UDP ${port}${NC}"
+    fi
+
+    if [ -d "$HY2_INSTALL_DIR" ]; then
+        compose_cmd=$(get_compose_cmd)
+        [ -z "$compose_cmd" ] && compose_cmd="docker compose"
+        echo -e "  日志查看: ${BOLD}cd ${HY2_INSTALL_DIR} && ${compose_cmd} logs --tail=50${NC}"
+    fi
+    echo ""
 }
 
 # ==================== 输出 SS 链接 ====================
@@ -1520,7 +1553,13 @@ EOF
         echo -e "${GREEN}✓${NC} HY2 服务启动成功"
     else
         echo -e "${RED}✗ HY2 服务启动失败，请检查日志: $compose_cmd -f $HY2_COMPOSE_FILE logs${NC}"
+        $compose_cmd logs --tail=50 2>/dev/null || true
         return 1
+    fi
+
+    if ! hy2_udp_listening "$hy2_port"; then
+        echo -e "${YELLOW}⚠ 未检测到 HY2 UDP ${hy2_port} 监听，最近日志如下:${NC}"
+        $compose_cmd logs --tail=50 2>/dev/null || true
     fi
 
     disable_password_auth
@@ -1554,6 +1593,7 @@ EOF
     echo -e "  证书:     ${BOLD}自签证书，客户端需允许 insecure${NC}"
     echo -e "  平台:     ${BOLD}${platform}${NC}"
     echo -e "  区域模式: ${BOLD}${region}${NC}"
+    print_hy2_diagnostics "$hy2_port" "$platform"
     echo ""
     echo -e "${CYAN}HY2 链接 (复制到客户端导入):${NC}"
     echo ""
@@ -1627,6 +1667,13 @@ status_hy2() {
     [ -z "$compose_cmd" ] && compose_cmd="docker compose"
     $compose_cmd ps
     echo ""
+
+    if [ -f "$HY2_CONFIG_FILE" ]; then
+        print_hy2_diagnostics "${HY2_PORT:-443}" "${PLATFORM:-unknown}"
+        echo -e "${BOLD}  最近日志:${NC}"
+        $compose_cmd logs --tail=30 2>/dev/null || true
+        echo ""
+    fi
 
     print_hy2_link
 }
