@@ -770,7 +770,16 @@ configure_firewall() {
 
         echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + ${service_name}(${protocol}/${port}) + ICMP"
     elif [ "$platform" = "azure" ]; then
-        echo -e "${GREEN}✓${NC} Azure 平台，跳过 iptables 配置 (使用 NSG 管理)"
+        echo -e "${GREEN}✓${NC} Azure 平台，使用 NSG 管理云防火墙"
+        if command -v iptables &>/dev/null; then
+            add_iptables_accept_rule "$protocol" "$port"
+            echo -e "${GREEN}✓${NC} 已补充本机放行规则: ${service_name}(${protocol}/${port})"
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save >/dev/null 2>&1 || true
+            elif [ -d /etc/iptables ]; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            fi
+        fi
         echo -e "${YELLOW}提示: 请确认 Azure NSG 已放行 ${protocol^^} ${port} 与 SSH 端口${NC}"
     else
         echo -e "${YELLOW}未知平台，是否配置防火墙? (仅开放 SSH + 代理端口 + ping)${NC}"
