@@ -21,8 +21,13 @@ NC='\033[0m'
 INSTALL_DIR="/opt/ssr"
 COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 CONFIG_FILE="$INSTALL_DIR/.env"
+HY2_INSTALL_DIR="/opt/hy2"
+HY2_COMPOSE_FILE="$HY2_INSTALL_DIR/docker-compose.yml"
+HY2_CONFIG_FILE="$HY2_INSTALL_DIR/.env"
+HY2_IMAGE="${VPS_HY2_IMAGE:-tobyxdd/hysteria:latest}"
 SS_PORT=22000
 SHADOW_TLS_PORT=443
+HY2_PORT=443
 TLS_HOST_AZURE="www.microsoft.com"
 TLS_HOST_ORACLE="www.apple.com"
 TLS_HOST_DEFAULT="www.apple.com"
@@ -298,6 +303,10 @@ generate_password() {
 }
 
 # ==================== 生成 ss:// 链接 ====================
+url_encode() {
+    printf '%s' "$1" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))" 2>/dev/null || printf '%s' "$1" | sed 's/ /%20/g; s/#/%23/g; s/@/%40/g; s/:/%3A/g; s/?/%3F/g; s/&/%26/g'
+}
+
 generate_ss_link() {
     local ip="$1"
     local password="$2"
@@ -317,9 +326,24 @@ generate_ss_link() {
 
     # URL encode tag (安全: 用 stdin 传递避免命令注入)
     local tag_encoded
-    tag_encoded=$(printf '%s' "$tag" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read()))" 2>/dev/null || printf '%s' "$tag" | sed 's/ /%20/g; s/#/%23/g')
+    tag_encoded=$(url_encode "$tag")
 
     echo "ss://${encoded}?tfo=1&shadow-tls=${stls_encoded}#${tag_encoded}"
+}
+
+# ==================== 生成 hysteria2:// 链接 ====================
+generate_hy2_link() {
+    local ip="$1"
+    local password="$2"
+    local port="$3"
+    local tag="$4"
+    local sni="$5"
+
+    local password_encoded tag_encoded
+    password_encoded=$(url_encode "$password")
+    tag_encoded=$(url_encode "$tag")
+
+    echo "hysteria2://${password_encoded}@${ip}:${port}/?sni=${sni}&insecure=1#${tag_encoded}"
 }
 
 # ==================== 输出 SS 链接 ====================
@@ -341,6 +365,28 @@ print_ss_link() {
     echo ""
     # 纯文本行，便于脚本调用方稳定提取
     echo "SS_LINK=${SS_LINK}"
+    echo ""
+    return 0
+}
+
+# ==================== 输出 HY2 链接 ====================
+print_hy2_link() {
+    echo ""
+    if [ ! -f "$HY2_CONFIG_FILE" ]; then
+        echo -e "${YELLOW}未找到配置，HY2 可能尚未安装${NC}"
+        return 1
+    fi
+
+    source "$HY2_CONFIG_FILE"
+    if [ -z "${HY2_LINK:-}" ]; then
+        echo -e "${RED}配置中未找到 HY2_LINK${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}HY2 链接:${NC}"
+    echo -e "${GREEN}${HY2_LINK}${NC}"
+    echo ""
+    echo "HY2_LINK=${HY2_LINK}"
     echo ""
     return 0
 }
@@ -608,9 +654,38 @@ install_docker_compose() {
 }
 
 # ==================== 配置 iptables (仅 Oracle) ====================
+add_iptables_accept_rule() {
+    local protocol="$1"
+    local port="$2"
+    [ -z "$port" ] && return 0
+    iptables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || \
+        iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
+}
+
+add_installed_proxy_firewall_rules() {
+    local current_protocol="$1"
+    local current_port="$2"
+
+    add_iptables_accept_rule "$current_protocol" "$current_port"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        local ssr_port
+        ssr_port=$(grep -E '^STLS_PORT=' "$CONFIG_FILE" | cut -d= -f2- | tr -d '"')
+        add_iptables_accept_rule "tcp" "$ssr_port"
+    fi
+
+    if [ -f "$HY2_CONFIG_FILE" ]; then
+        local hy2_port
+        hy2_port=$(grep -E '^HY2_PORT=' "$HY2_CONFIG_FILE" | cut -d= -f2- | tr -d '"')
+        add_iptables_accept_rule "udp" "$hy2_port"
+    fi
+}
+
 configure_firewall() {
     local platform="$1"
-    local port="$2"  # Shadow-TLS 端口
+    local port="$2"  # 代理端口
+    local protocol="${3:-tcp}"
+    local service_name="${4:-Proxy}"
 
     if [ "$platform" = "oracle" ]; then
         echo -e "${CYAN}检测到 Oracle Cloud，配置防火墙...${NC}"
@@ -630,7 +705,7 @@ configure_firewall() {
         iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
         iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
         iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+        add_installed_proxy_firewall_rules "$protocol" "$port"
         iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: " --log-level 4
 
         # 规则就绪后再设置默认策略
@@ -647,10 +722,10 @@ configure_firewall() {
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         fi
 
-        echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + Shadow-TLS(${port}) + ICMP"
+        echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + ${service_name}(${protocol}/${port}) + ICMP"
     elif [ "$platform" = "azure" ]; then
         echo -e "${GREEN}✓${NC} Azure 平台，跳过 iptables 配置 (使用 NSG 管理)"
-        echo -e "${YELLOW}提示: 请确认 Azure NSG 已放行 TCP ${port} 与 SSH 端口${NC}"
+        echo -e "${YELLOW}提示: 请确认 Azure NSG 已放行 ${protocol^^} ${port} 与 SSH 端口${NC}"
     else
         echo -e "${YELLOW}未知平台，是否配置防火墙? (仅开放 SSH + 代理端口 + ping)${NC}"
         read -rp "[y/N]: " answer
@@ -664,7 +739,7 @@ configure_firewall() {
             iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
             iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
             iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+            add_installed_proxy_firewall_rules "$protocol" "$port"
             iptables -P INPUT DROP
             iptables -P FORWARD DROP
             iptables -P OUTPUT ACCEPT
@@ -677,7 +752,7 @@ configure_firewall() {
                 mkdir -p /etc/iptables
                 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
             fi
-            echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + Shadow-TLS(${port}) + ICMP"
+            echo -e "${GREEN}✓${NC} 防火墙已配置: SSH(${ssh_port}) + ${service_name}(${protocol}/${port}) + ICMP"
         fi
     fi
 }
@@ -1140,7 +1215,7 @@ install_ssr() {
     install_docker_compose || { echo -e "${RED}Docker Compose 安装失败${NC}"; return 1; }
 
     # 防火墙
-    configure_firewall "$platform" "$stls_port"
+    configure_firewall "$platform" "$stls_port" "tcp" "Shadow-TLS"
 
     # 网络优化 (稳速优先)
     optimize_network_performance "$platform" "$region"
@@ -1286,6 +1361,270 @@ EOF
     echo ""
     echo "SS_LINK=${ss_link}"
     echo ""
+}
+
+# ==================== 安装 HY2 ====================
+install_hy2() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${CYAN}  Hysteria2 部署${NC}"
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    if [ -f "$HY2_COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}HY2 已安装，如需重新安装请先删除${NC}"
+        print_hy2_link
+        return
+    fi
+
+    echo -e "${CYAN}正在检测平台...${NC}"
+    local platform
+    platform=$(detect_platform)
+    echo -e "${GREEN}✓${NC} 平台: ${BOLD}${platform}${NC}"
+
+    local region
+    if [ "$REGION_MODE" = "auto" ]; then
+        region=$(detect_region)
+    else
+        region="$REGION_MODE"
+    fi
+    echo -e "${GREEN}✓${NC} 网络区域: ${BOLD}${region}${NC}"
+    echo ""
+
+    if [ "$region" = "cn" ]; then
+        optimize_for_mainland
+    else
+        configure_apt_network
+    fi
+
+    local default_sni
+    case "$platform" in
+        azure)  default_sni="$TLS_HOST_AZURE" ;;
+        oracle) default_sni="$TLS_HOST_ORACLE" ;;
+        *)      default_sni="$TLS_HOST_DEFAULT" ;;
+    esac
+
+    local node_name="${VPS_NODE_NAME:-}"
+    if [ -z "$node_name" ] && [ "$AUTO_YES" != "1" ]; then
+        read -rp "输入 HY2 节点名称 (如 Azure-HY2-01): " node_name
+    fi
+    if [ -z "$node_name" ]; then
+        if [ "$platform" = "azure" ]; then
+            node_name="Azure-HY2-$(date +%m%d%H%M)"
+        else
+            node_name="HY2-$(date +%s | tail -c 5)"
+        fi
+    fi
+
+    local hy2_port="${VPS_HY2_PORT:-$HY2_PORT}"
+    local custom_port=""
+    if [ "$AUTO_YES" != "1" ] && [ -z "${VPS_HY2_PORT:-}" ]; then
+        read -rp "HY2 UDP 监听端口 [默认 443]: " custom_port
+        [ -n "$custom_port" ] && hy2_port=$custom_port
+    fi
+
+    local sni="${VPS_HY2_SNI:-${VPS_TLS_HOST:-$default_sni}}"
+    local custom_sni=""
+    if [ "$AUTO_YES" != "1" ] && [ -z "${VPS_HY2_SNI:-}${VPS_TLS_HOST:-}" ]; then
+        read -rp "HY2 SNI/伪装域名 [默认 ${default_sni}]: " custom_sni
+        [ -n "$custom_sni" ] && sni=$custom_sni
+    fi
+
+    echo ""
+
+    harden_system
+    install_base_dependencies
+    install_docker "$region" || { echo -e "${RED}Docker 安装失败${NC}"; return 1; }
+    configure_docker_mirror "$region"
+    install_docker_compose || { echo -e "${RED}Docker Compose 安装失败${NC}"; return 1; }
+
+    configure_firewall "$platform" "$hy2_port" "udp" "HY2"
+    optimize_network_performance "$platform" "$region"
+    install_fail2ban
+
+    if [ "$platform" = "oracle" ]; then
+        setup_oracle_keepalive
+    fi
+
+    mkdir -p "$HY2_INSTALL_DIR"
+
+    local password
+    password=$(generate_password)
+
+    local public_ip
+    public_ip=$(get_public_ip "$platform")
+
+    if ! openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$HY2_INSTALL_DIR/server.key" \
+        -out "$HY2_INSTALL_DIR/server.crt" \
+        -days 3650 -subj "/CN=${sni}" >/dev/null 2>&1; then
+        echo -e "${RED}✗ HY2 自签证书生成失败${NC}"
+        return 1
+    fi
+    chmod 600 "$HY2_INSTALL_DIR/server.key"
+
+    cat > "$HY2_INSTALL_DIR/config.yaml" << EOF
+listen: :${hy2_port}
+
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+auth:
+  type: password
+  password: ${password}
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${sni}/
+    rewriteHost: true
+
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+EOF
+
+    cat > "$HY2_COMPOSE_FILE" << EOF
+services:
+  hysteria2:
+        image: ${HY2_IMAGE}
+    restart: always
+    network_mode: "host"
+    volumes:
+      - ./config.yaml:/etc/hysteria/config.yaml:ro
+      - ./server.crt:/etc/hysteria/server.crt:ro
+      - ./server.key:/etc/hysteria/server.key:ro
+    command: ["server", "-c", "/etc/hysteria/config.yaml"]
+EOF
+
+    echo ""
+    echo -e "${CYAN}正在拉取 HY2 镜像并启动...${NC}"
+    cd "$HY2_INSTALL_DIR"
+    local compose_cmd
+    compose_cmd=$(get_compose_cmd)
+    if [ -z "$compose_cmd" ]; then
+        echo -e "${RED}Docker Compose 未找到${NC}"
+        return 1
+    fi
+    $compose_cmd up -d
+
+    sleep 3
+    if $compose_cmd ps | grep -q "Up\|running"; then
+        echo -e "${GREEN}✓${NC} HY2 服务启动成功"
+    else
+        echo -e "${RED}✗ HY2 服务启动失败，请检查日志: $compose_cmd -f $HY2_COMPOSE_FILE logs${NC}"
+        return 1
+    fi
+
+    disable_password_auth
+
+    local hy2_link
+    hy2_link=$(generate_hy2_link "$public_ip" "$password" "$hy2_port" "$node_name" "$sni")
+
+    cat > "$HY2_CONFIG_FILE" << EOF
+PLATFORM="${platform}"
+REGION="${region}"
+PUBLIC_IP="${public_ip}"
+PASSWORD="${password}"
+HY2_PORT="${hy2_port}"
+HY2_SNI="${sni}"
+NODE_NAME="${node_name}"
+HY2_LINK="${hy2_link}"
+INSTALL_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+    chmod 600 "$HY2_CONFIG_FILE"
+
+    echo ""
+    echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${GREEN}  HY2 部署完成!${NC}"
+    echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  节点名称: ${BOLD}${node_name}${NC}"
+    echo -e "  服务器IP: ${BOLD}${public_ip}${NC}"
+    echo -e "  端口:     ${BOLD}${hy2_port}/UDP${NC}"
+    echo -e "  密码:     ${BOLD}${password}${NC}"
+    echo -e "  SNI:      ${BOLD}${sni}${NC}"
+    echo -e "  证书:     ${BOLD}自签证书，客户端需允许 insecure${NC}"
+    echo -e "  平台:     ${BOLD}${platform}${NC}"
+    echo -e "  区域模式: ${BOLD}${region}${NC}"
+    echo ""
+    echo -e "${CYAN}HY2 链接 (复制到客户端导入):${NC}"
+    echo ""
+    echo -e "${GREEN}${hy2_link}${NC}"
+    echo ""
+    echo "HY2_LINK=${hy2_link}"
+    echo ""
+}
+
+# ==================== 删除 HY2 ====================
+uninstall_hy2() {
+    echo ""
+    echo -e "${BOLD}${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${RED}  删除 Hysteria2${NC}"
+    echo -e "${BOLD}${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    if [ ! -f "$HY2_COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}HY2 未安装${NC}"
+        return
+    fi
+
+    read -rp "确认删除 HY2? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${DIM}已取消${NC}"
+        return
+    fi
+
+    echo -e "${CYAN}正在停止并删除 HY2 容器...${NC}"
+    cd "$HY2_INSTALL_DIR"
+    local compose_cmd
+    compose_cmd=$(get_compose_cmd)
+    [ -z "$compose_cmd" ] && compose_cmd="docker compose"
+    $compose_cmd down --rmi all 2>/dev/null || $compose_cmd down 2>/dev/null
+
+    echo -e "${CYAN}清理 HY2 文件...${NC}"
+    rm -rf "$HY2_INSTALL_DIR"
+
+    echo ""
+    echo -e "${GREEN}✓${NC} HY2 已删除"
+    echo ""
+}
+
+# ==================== 查看 HY2 状态 ====================
+status_hy2() {
+    echo ""
+    if [ ! -f "$HY2_COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}HY2 未安装${NC}"
+        return
+    fi
+
+    echo -e "${BOLD}${CYAN}━━━ HY2 状态 ━━━${NC}"
+    echo ""
+
+    if [ -f "$HY2_CONFIG_FILE" ]; then
+        source "$HY2_CONFIG_FILE"
+        echo -e "  节点名称: ${BOLD}${NODE_NAME}${NC}"
+        echo -e "  服务器IP: ${BOLD}${PUBLIC_IP}${NC}"
+        echo -e "  端口:     ${BOLD}${HY2_PORT}/UDP${NC}"
+        echo -e "  SNI:      ${BOLD}${HY2_SNI}${NC}"
+        [ -n "${PLATFORM:-}" ] && echo -e "  平台:     ${BOLD}${PLATFORM}${NC}"
+        [ -n "${REGION:-}" ] && echo -e "  区域模式: ${BOLD}${REGION}${NC}"
+        echo -e "  安装时间: ${BOLD}${INSTALL_DATE}${NC}"
+        echo ""
+    fi
+
+    cd "$HY2_INSTALL_DIR"
+    echo -e "${BOLD}  容器状态:${NC}"
+    local compose_cmd
+    compose_cmd=$(get_compose_cmd)
+    [ -z "$compose_cmd" ] && compose_cmd="docker compose"
+    $compose_cmd ps
+    echo ""
+
+    print_hy2_link
 }
 
 # ==================== 删除 SSR ====================
@@ -1446,6 +1785,9 @@ show_menu() {
     echo -e "  ${GREEN}7)${NC} Oracle Cloud 保活 (防停机回收)"
     echo -e "  ${GREEN}8)${NC} 网络测速 (检测带宽限速)"
     echo -e "  ${GREEN}9)${NC} 仅输出 SS 链接 (便于复制)"
+    echo -e "  ${GREEN}10)${NC} 安装 HY2 (Hysteria2, UDP)"
+    echo -e "  ${GREEN}11)${NC} 删除 HY2"
+    echo -e "  ${GREEN}12)${NC} 查看 HY2 状态/链接"
     echo -e "  ${GREEN}0)${NC} 退出"
     echo ""
 }
@@ -1482,7 +1824,7 @@ main() {
             --yes|-y)
                 AUTO_YES="1"
                 ;;
-            install|uninstall|remove|status|link)
+            install|uninstall|remove|status|link|install-hy2|hy2|uninstall-hy2|remove-hy2|status-hy2|hy2-link)
                 [ -z "$cmd" ] && cmd="$arg"
                 ;;
         esac
@@ -1491,9 +1833,13 @@ main() {
     # 支持直接命令
     case "${cmd:-${1:-}}" in
         install) install_ssr; exit 0 ;;
+        install-hy2|hy2) install_hy2; exit 0 ;;
         uninstall|remove) uninstall_ssr; exit 0 ;;
+        uninstall-hy2|remove-hy2) uninstall_hy2; exit 0 ;;
         status) status_ssr; exit 0 ;;
+        status-hy2) status_hy2; exit 0 ;;
         link) print_ss_link; exit $? ;;
+        hy2-link) print_hy2_link; exit $? ;;
         *) ;;
     esac
 
@@ -1520,6 +1866,9 @@ main() {
             7) setup_oracle_keepalive ;;
             8) speed_test ;;
             9) print_ss_link ;;
+            10) install_hy2 ;;
+            11) uninstall_hy2 ;;
+            12) status_hy2 ;;
             0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac

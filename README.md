@@ -1,6 +1,6 @@
 # VPS 一键工具箱
 
-一键部署 Shadowsocks + Shadow-TLS 代理服务，同时完成系统安全加固。
+一键部署 Shadowsocks + Shadow-TLS 或 Hysteria2 代理服务，同时完成系统安全加固。
 
 ## 功能
 
@@ -8,14 +8,14 @@
 
 - 系统安全加固 (更新/SSH加固/内核加固/清理无用服务)
 - 安装 Docker + Docker Compose
-- 部署 Shadowsocks + Shadow-TLS (Docker容器)
+- 部署 Shadowsocks + Shadow-TLS 或 Hysteria2 (Docker容器)
 - 启用 BBR 拥塞控制
 - 配置防火墙 (Oracle 自动配置 iptables)
 - 安装 fail2ban (封禁暴力破解IP)
 - 防滥用保护 (限连接/限速率/限流量)
 - Oracle Cloud 保活 (自动适配CPU核心数)
 - 关闭 SSH 密码登录
-- 生成 ss:// 导入链接
+- 生成 ss:// 或 hysteria2:// 导入链接
 
 ### 平台自动适配
 
@@ -41,6 +41,23 @@ curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh | sudo bash -s -- inst
 
 也可以使用等价写法 `--azure --cn`。
 
+安装 HY2：
+
+```bash
+curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh | sudo bash -s -- install-hy2 --azure-cn
+```
+
+HY2 默认使用 UDP 443。Azure 需要在 NSG 入站规则放行 `UDP/443`；SS + Shadow-TLS 使用 `TCP/443`。
+
+HY2 免交互安装可覆盖节点名、UDP 端口和 SNI：
+
+```bash
+curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh | sudo env VPS_NODE_NAME="Azure-HY2-01" \
+  VPS_HY2_PORT=443 \
+  VPS_HY2_SNI="www.microsoft.com" \
+  bash -s -- install-hy2 --azure-cn --yes
+```
+
 免交互安装可加 `--yes`，也可以用环境变量覆盖默认节点名、端口、TLS 伪装域名和 Docker 镜像站：
 
 ```bash
@@ -50,7 +67,7 @@ curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh | sudo env VPS_NODE_NA
   bash -s -- install --azure-cn --yes
 ```
 
-如果默认 Docker Hub 镜像站不可用，可自定义：
+如果默认 Docker Hub 镜像站不可用，可自定义；HY2 镜像也可用 `VPS_HY2_IMAGE` 覆盖：
 
 ```bash
 curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh | sudo env VPS_DOCKER_MIRRORS="https://mirror1.example.com,https://mirror2.example.com" \
@@ -61,10 +78,14 @@ curl -fsSL https://macmini21.github.io/vps-toolkit/vps.sh | sudo env VPS_DOCKER_
 
 ```bash
 sudo bash vps.sh install    # 直接安装
+sudo bash vps.sh install-hy2 # 直接安装 HY2
 sudo bash vps.sh uninstall  # 直接删除
+sudo bash vps.sh uninstall-hy2 # 直接删除 HY2
 sudo bash vps.sh status     # 查看状态/链接
+sudo bash vps.sh status-hy2  # 查看 HY2 状态/链接
 sudo bash vps.sh install --azure --cn --yes  # Azure + 大陆免交互安装
 sudo bash vps.sh install --azure-cn --yes    # 同上，快捷写法
+sudo bash vps.sh install-hy2 --azure-cn --yes # Azure + 大陆免交互安装 HY2
 ```
 
 ## 交互菜单
@@ -77,6 +98,11 @@ sudo bash vps.sh install --azure-cn --yes    # 同上，快捷写法
 5) 安装 fail2ban
 6) SSR 防滥用保护 (限连接/限流量)
 7) Oracle Cloud 保活 (防停机回收)
+8) 网络测速 (检测带宽限速)
+9) 仅输出 SS 链接 (便于复制)
+10) 安装 HY2 (Hysteria2, UDP)
+11) 删除 HY2
+12) 查看 HY2 状态/链接
 0) 退出
 ```
 
@@ -110,6 +136,12 @@ sudo bash vps.sh install --azure-cn --yes    # 同上，快捷写法
 - Shadowrocket (iOS)
 - Clash Meta / mihomo
 - sing-box
+
+HY2 会输出 `hysteria2://` 链接，使用自签证书，链接中会带 `insecure=1`。常见支持客户端：
+
+- Shadowrocket (iOS)
+- v2rayN / NekoRay
+- sing-box / mihomo
 
 ## 依赖 (自动安装)
 
