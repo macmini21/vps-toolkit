@@ -1372,9 +1372,13 @@ install_hy2() {
     echo ""
 
     if [ -f "$HY2_COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}HY2 已安装，如需重新安装请先删除${NC}"
-        print_hy2_link
-        return
+        if [ -f "$HY2_CONFIG_FILE" ]; then
+            echo -e "${YELLOW}HY2 已安装，如需重新安装请先删除${NC}"
+            print_hy2_link
+            return
+        fi
+        echo -e "${YELLOW}检测到未完成的 HY2 安装，自动清理后重装...${NC}"
+        rm -rf "$HY2_INSTALL_DIR"
     fi
 
     echo -e "${CYAN}正在检测平台...${NC}"
