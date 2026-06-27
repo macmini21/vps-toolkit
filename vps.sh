@@ -1464,33 +1464,33 @@ install_hy2() {
     chmod 600 "$HY2_INSTALL_DIR/server.key"
 
     cat > "$HY2_INSTALL_DIR/config.yaml" << EOF
-listen: :${hy2_port}
+listen: ":${hy2_port}"
 
 tls:
-  cert: /etc/hysteria/server.crt
-  key: /etc/hysteria/server.key
+    cert: "/etc/hysteria/server.crt"
+    key: "/etc/hysteria/server.key"
 
 auth:
-  type: password
-  password: ${password}
+    type: password
+    password: "${password}"
 
 masquerade:
-  type: proxy
-  proxy:
-    url: https://${sni}/
-    rewriteHost: true
+    type: proxy
+    proxy:
+        url: "https://${sni}/"
+        rewriteHost: true
 
 quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
+    initStreamReceiveWindow: 8388608
+    maxStreamReceiveWindow: 8388608
+    initConnReceiveWindow: 20971520
+    maxConnReceiveWindow: 20971520
 EOF
 
     cat > "$HY2_COMPOSE_FILE" << EOF
 services:
   hysteria2:
-        image: ${HY2_IMAGE}
+    image: "${HY2_IMAGE}"
     restart: always
     network_mode: "host"
     volumes:
