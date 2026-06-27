@@ -1658,6 +1658,10 @@ status_hy2() {
         [ -n "${REGION:-}" ] && echo -e "  区域模式: ${BOLD}${REGION}${NC}"
         echo -e "  安装时间: ${BOLD}${INSTALL_DATE}${NC}"
         echo ""
+    else
+        echo -e "${YELLOW}未找到 HY2 配置文件，可能是上次安装未完成${NC}"
+        echo -e "${YELLOW}建议直接重新执行 install-hy2，脚本会自动清理未完成安装${NC}"
+        echo ""
     fi
 
     cd "$HY2_INSTALL_DIR"
@@ -1668,12 +1672,10 @@ status_hy2() {
     $compose_cmd ps
     echo ""
 
-    if [ -f "$HY2_CONFIG_FILE" ]; then
-        print_hy2_diagnostics "${HY2_PORT:-443}" "${PLATFORM:-unknown}"
-        echo -e "${BOLD}  最近日志:${NC}"
-        $compose_cmd logs --tail=30 2>/dev/null || true
-        echo ""
-    fi
+    print_hy2_diagnostics "${HY2_PORT:-443}" "${PLATFORM:-unknown}"
+    echo -e "${BOLD}  最近日志:${NC}"
+    $compose_cmd logs --tail=30 2>/dev/null || true
+    echo ""
 
     print_hy2_link
 }
